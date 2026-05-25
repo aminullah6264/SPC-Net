@@ -372,9 +372,16 @@ class WindowAttentionBlock(nn.Module):
         x_hwc = x.permute(0, 2, 3, 1)
 
         # Window attention with residual
+        # Force float32: the concat input is 1536-d (768+768) and QK^T in
+        # fp16 with d_head=192 regularly overflows after ~20 epochs of
+        # weight drift, producing all-NaN outputs.
         shortcut = x_hwc
         wins, B_, H_, W_, Hp, Wp = self._partition(self.norm1(x_hwc))
-        attn_out, _ = self.attn(wins, wins, wins, need_weights=False)
+        orig_dtype = wins.dtype
+        attn_out, _ = self.attn(
+            wins.float(), wins.float(), wins.float(),
+            need_weights=False)
+        attn_out = attn_out.to(orig_dtype)
         x_hwc = self._reverse(attn_out, B_, H_, W_, Hp, Wp) + shortcut
 
         # MLP with residual
@@ -498,9 +505,11 @@ class SAMBlock(nn.Module):
             ir = self.decoder_block.cross_attn_image_to_token(
                 img_tokens, pt_t2i, pt_t2i)                           # (B, H*W, sam_dim)
 
-            # Reshape to spatial map and blend with dense prompt
+            # Reshape to spatial map and blend with dense prompt.
+            # Clamp prevents fp16 overflow from the de*feat_sam product
+            # accumulating over many training steps.
             xmap = ir.permute(0, 2, 1).view(B, self.sam_dim, H, W)
-            out_list.append(xmap + de * feat_sam)
+            out_list.append((xmap + de * feat_sam).clamp(-100, 100))
 
         # Pad if fewer prompts were generated than num_prompts
         while len(out_list) < self.num_prompts:
@@ -813,10 +822,13 @@ class ESCNet(nn.Module):
         # Level 1 → block 5  (mid-low)
         # Level 2 → block 8  (mid-high)
         # Level 3 → block 11 (deep)
-        l0   = self._tokens_to_spatial(self._hook_cache[0])
-        l1   = self._tokens_to_spatial(self._hook_cache[1])
-        l2   = self._tokens_to_spatial(self._hook_cache[2])
-        high = self._tokens_to_spatial(self._hook_cache[3])
+        # Clamp ViT activations to a safe range before they enter the rest of
+        # the pipeline.  Unclamped fp16 ViT outputs can reach ±thousands after
+        # 15+ epochs and cause NaN in subsequent attention/product ops.
+        l0   = self._tokens_to_spatial(self._hook_cache[0]).clamp(-100, 100)
+        l1   = self._tokens_to_spatial(self._hook_cache[1]).clamp(-100, 100)
+        l2   = self._tokens_to_spatial(self._hook_cache[2]).clamp(-100, 100)
+        high = self._tokens_to_spatial(self._hook_cache[3]).clamp(-100, 100)
         mid  = l1  # block-5 features used for mid-level correlation
 
         return {'high': high, 'mid': mid, 'skips': [l0, l1, l2]}
@@ -1079,6 +1091,10 @@ def train_loop(model, dataloader, optimizer, scheduler, device, epochs,
     scaler     = GradScaler('cuda', init_scale=4096.0, growth_interval=2000)
     best_dice  = 0.0
     last_path  = save_path.replace('escnet_best.pth', 'escnet_last.pth')
+    # "clean" checkpoint: only saved when the epoch has ZERO NaN batches.
+    # Used as the recovery target so we never reload a checkpoint that was
+    # itself produced during a corrupted epoch.
+    clean_path = save_path.replace('escnet_best.pth', 'escnet_clean.pth')
     diag_path  = save_path.replace('escnet_best.pth', 'training_diagnostics.csv')
 
     history = {'loss': [], 'dice': [], 'iou': [], 'lr': []}
@@ -1128,16 +1144,21 @@ def train_loop(model, dataloader, optimizer, scheduler, device, epochs,
 
                     # ── Checkpoint recovery ───────────────────────────────────
                     # 3+ consecutive NaN batches means weights are corrupted.
-                    # Reload the last saved best checkpoint so training can
-                    # continue instead of wasting the rest of the epoch.
-                    if consecutive_nan >= 3 and os.path.exists(save_path):
-                        ckpt_r = torch.load(save_path, map_location=device,
-                                            weights_only=False)
-                        model.load_state_dict(ckpt_r['model_state'])
-                        optimizer.load_state_dict(ckpt_r['optimizer_state'])
-                        print(f"  [RECOVER] Reloaded best ckpt "
-                              f"(epoch {ckpt_r['epoch']}, "
-                              f"dice={ckpt_r.get('best_dice', 0):.4f})")
+                    # Always prefer the "clean" checkpoint (last epoch with 0
+                    # NaN batches) over the "best" checkpoint which may itself
+                    # have been saved during a partially-corrupted epoch.
+                    if consecutive_nan >= 3:
+                        recovery = (clean_path if os.path.exists(clean_path)
+                                    else save_path)
+                        if os.path.exists(recovery):
+                            ckpt_r = torch.load(recovery, map_location=device,
+                                                weights_only=False)
+                            model.load_state_dict(ckpt_r['model_state'])
+                            optimizer.load_state_dict(ckpt_r['optimizer_state'])
+                            tag = 'clean' if recovery == clean_path else 'best'
+                            print(f"  [RECOVER] Reloaded {tag} ckpt "
+                                  f"(epoch {ckpt_r['epoch']}, "
+                                  f"dice={ckpt_r.get('best_dice', ckpt_r.get('avg_dice', 0)):.4f})")
                         consecutive_nan = 0   # reset streak after reload
 
                     continue            # ← no scaler.update(); backward never called
@@ -1176,7 +1197,7 @@ def train_loop(model, dataloader, optimizer, scheduler, device, epochs,
             optimizer.zero_grad()
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
-            gn = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            gn = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
             scaler.step(optimizer)
             scaler.update()
 
@@ -1228,17 +1249,28 @@ def train_loop(model, dataloader, optimizer, scheduler, device, epochs,
         last_payload = {
             'epoch': epoch, 'model_state': model.state_dict(),
             'optimizer_state': optimizer.state_dict(),
-            'history': history,
+            'avg_dice': avg_dice, 'history': history,
         }
         torch.save(last_payload, last_path)
 
-        # ── Checkpoint: best training Dice ────────────────────────────────────
         saved_tag = "last"
-        if avg_dice > best_dice:
+
+        # ── Checkpoint: "clean" — only when the epoch has ZERO NaN batches ────
+        # This is the recovery target.  Using the "best" checkpoint as recovery
+        # target was the bug: best may have been saved during a 55-NaN epoch,
+        # so reloading it kept the model in a corrupted state.
+        if nan_batches == 0:
+            torch.save(last_payload, clean_path)
+            saved_tag = "clean+last"
+
+        # ── Checkpoint: best training Dice (only when epoch is clean) ─────────
+        # Prevents a high-Dice epoch that also had many NaN batches from
+        # overwriting the best checkpoint with a semi-corrupted state.
+        if avg_dice > best_dice and nan_batches == 0:
             best_dice = avg_dice
             best_payload = {**last_payload, 'best_dice': best_dice}
             torch.save(best_payload, save_path)
-            saved_tag = "best+last"
+            saved_tag = "best+clean+last"
 
         nan_tag = f"{nan_batches}nan" if nan_batches else f"{amp_scale_drops}ovf"
         print(f"{epoch:>6}  {avg_loss:>8.4f}  {avg_dice:>8.4f}  "
@@ -1248,6 +1280,7 @@ def train_loop(model, dataloader, optimizer, scheduler, device, epochs,
     print(f"\n[INFO] Diagnostics CSV  : {diag_path}")
     print(f"[INFO] Best Train Dice  : {best_dice:.4f}  → {save_path}")
     print(f"[INFO] Last checkpoint  : epoch {epochs}    → {last_path}")
+    print(f"[INFO] Last clean ckpt  : → {clean_path}")
     return history
 
 # ─────────────────────────────────────────────────────────────────────────────
