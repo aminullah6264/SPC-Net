@@ -1048,25 +1048,84 @@ def tta_predict(model, img_t, tokens):
 #  LR SCHEDULER
 # ─────────────────────────────────────────────────────────────────────────────
 class WarmupCosineScheduler(torch.optim.lr_scheduler._LRScheduler):
-    """Linear warmup for `warmup_epochs`, then cosine decay to `eta_min`."""
+    """Linear warmup then segment-wise cosine decay with milestone drops.
+
+    After the warmup phase the LR follows a fresh cosine curve within each
+    segment.  At each milestone the *starting* LR of the new segment is
+    multiplied by ``milestone_decay``, producing a staircase-cosine shape.
+
+    Example  (total=100, milestones=[0.5, 0.75], decay=0.1, warmup=5):
+      segment 0  ep  5-49   cosine  base_lr      → base_lr * 0.1
+      segment 1  ep 50-74   cosine  base_lr*0.1  → base_lr * 0.01
+      segment 2  ep 75-99   cosine  base_lr*0.01 → eta_min
+
+    Args:
+        milestones:      list of *fractions* of total_epochs (e.g. [0.5, 0.75]).
+                         Defaults to [0.5, 0.75].
+        milestone_decay: multiplicative factor applied at each milestone.
+                         Default 0.1 (one decade per milestone).
+    """
     def __init__(self, optimizer, warmup_epochs, total_epochs,
+                 milestones=None, milestone_decay=0.1,
                  eta_min=1e-6, last_epoch=-1):
-        self.warmup_epochs = warmup_epochs
-        self.total_epochs  = total_epochs
-        self.eta_min       = eta_min
+        self.warmup_epochs   = warmup_epochs
+        self.total_epochs    = total_epochs
+        self.milestone_decay = milestone_decay
+        self.eta_min         = eta_min
+
+        if milestones is None:
+            milestones = [0.5, 0.75]
+
+        # Convert fractional milestones → integer epoch breakpoints.
+        # Always include warmup_end and total_epochs; deduplicate & sort.
+        ms_ep = [int(f * total_epochs) for f in milestones]
+        self._breaks = sorted(set(
+            [warmup_epochs]
+            + [m for m in ms_ep if m > warmup_epochs]
+            + [total_epochs]
+        ))
+
         super().__init__(optimizer, last_epoch)
+
+    # ------------------------------------------------------------------
+    def _segment_for(self, ep):
+        """Return (seg_index, seg_start, seg_end) for a given epoch."""
+        breaks = self._breaks
+        for i in range(len(breaks) - 1):
+            if ep < breaks[i + 1]:
+                return i, breaks[i], breaks[i + 1]
+        # ep >= total_epochs: clamp to last segment
+        return len(breaks) - 2, breaks[-2], breaks[-1]
 
     def get_lr(self):
         ep = self.last_epoch
+
+        # ── Warmup ───────────────────────────────────────────────────────────
         if ep < self.warmup_epochs:
             factor = (ep + 1) / max(self.warmup_epochs, 1)
-        else:
-            progress = ((ep - self.warmup_epochs) /
-                        max(self.total_epochs - self.warmup_epochs, 1))
-            factor   = (self.eta_min / self.base_lrs[0] +
-                        0.5 * (1 - self.eta_min / self.base_lrs[0]) *
-                        (1 + math.cos(math.pi * progress)))
-        return [base_lr * factor for base_lr in self.base_lrs]
+            return [base_lr * factor for base_lr in self.base_lrs]
+
+        # ── Segment-wise cosine ───────────────────────────────────────────────
+        num_segs         = len(self._breaks) - 1
+        seg, seg_s, seg_e = self._segment_for(ep)
+        seg_len          = max(seg_e - seg_s, 1)
+        progress         = (ep - seg_s) / seg_len          # 0 → 1 within seg
+
+        d      = self.milestone_decay
+        hi_fac = d ** seg                                   # seg-start multiplier
+        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+
+        lrs = []
+        for base_lr in self.base_lrs:
+            lr_hi = base_lr * hi_fac
+            if seg == num_segs - 1:
+                # Last segment → decay all the way to eta_min
+                lr = self.eta_min + (lr_hi - self.eta_min) * cosine
+            else:
+                lr_lo = base_lr * (d ** (seg + 1))
+                lr = lr_lo + (lr_hi - lr_lo) * cosine
+            lrs.append(max(lr, self.eta_min))
+        return lrs
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  TRAINING LOOP
@@ -1649,6 +1708,15 @@ def parse_args():
                    help="Disable test-time augmentation during evaluation")
     p.add_argument('--no-prompt-bank', action='store_true',
                    help="Disable multi-prompt bank (use single caption only)")
+    # LR milestones
+    p.add_argument('--milestones', nargs='+', type=float, default=[0.5, 0.75],
+                   metavar='F',
+                   help="Fractional-epoch milestones for LR reduction "
+                        "(e.g. --milestones 0.5 0.75).  "
+                        "Each value is a fraction of --epochs.")
+    p.add_argument('--milestone-decay', type=float, default=0.1,
+                   help="Multiplicative LR factor applied at each milestone "
+                        "(default 0.1 = one decade per drop)")
     return p.parse_args()
 
 
@@ -1717,6 +1785,8 @@ def main():
         optimizer,
         warmup_epochs=args.warmup_ep,
         total_epochs=args.epochs,
+        milestones=args.milestones,
+        milestone_decay=args.milestone_decay,
         eta_min=1e-6)
 
     # ── Resume from checkpoint  ───────────────────────────────────────────────
