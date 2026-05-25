@@ -1344,34 +1344,119 @@ def evaluate_loop(model, images_dir, masks_dir, device,
     return dice_arr, iou_arr
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  TEST LOOP  (save side-by-side visualisations)
 # ─────────────────────────────────────────────────────────────────────────────
-def test_loop(model, images_dir, output_dir, device, threshold=0.5):
+#  TEST LOOP  (save visualisations)
+# ─────────────────────────────────────────────────────────────────────────────
+def _make_overlay(image_np: np.ndarray, mask_bin: np.ndarray,
+                  colour: tuple, alpha: float = 0.45) -> np.ndarray:
+    """
+    Blend a boolean mask over an RGB image and draw a 1-px contour border.
+    colour : (R, G, B) in [0, 255]
+    Returns a uint8 RGB array.
+    """
+    from scipy.ndimage import binary_dilation
+    out = image_np.copy().astype(np.float32)
+    c   = np.array(colour, dtype=np.float32)
+    # Semi-transparent fill
+    out[mask_bin] = out[mask_bin] * (1 - alpha) + c * alpha
+    # Solid 1-px border  (dilated XOR original)
+    border = binary_dilation(mask_bin, iterations=2) & ~mask_bin
+    out[border] = c
+    return out.clip(0, 255).astype(np.uint8)
+
+
+def test_loop(model, images_dir, output_dir, device,
+              masks_dir=None, threshold=0.5):
+    """
+    Save per-image visualisation panels for all images in `images_dir`.
+
+    Layout when GT masks are available (masks_dir is set):
+      ┌──────────────┬──────────────────┬──────────────────────────────┐
+      │ Input image  │  GT overlay (⬜) │  Prediction overlay (🟥)     │
+      │              │  (green)         │  Dice=X.XXX  IoU=X.XXX       │
+      └──────────────┴──────────────────┴──────────────────────────────┘
+
+    Layout without GT (masks_dir=None or mask not found):
+      ┌──────────────┬──────────────────────┐
+      │ Input image  │  Prediction overlay  │
+      └──────────────┴──────────────────────┘
+
+    Overlays: green fill+border = GT, red fill+border = Prediction.
+    Per-image Dice / IoU are shown in the prediction panel title.
+    Files are saved as <output_dir>/<stem>.png at 150 dpi.
+    """
     os.makedirs(output_dir, exist_ok=True)
     model.eval()
     image_files = sorted([f for f in os.listdir(images_dir)
-                           if f.lower().endswith(IMAGE_EXTENSIONS)])
-    print(f"\n[INFO] Generating test outputs → {output_dir}")
+                          if f.lower().endswith(IMAGE_EXTENSIONS)])
+    print(f"\n[INFO] Generating test visualisations → {output_dir}")
 
+    saved = 0
     for fn in image_files:
         image    = Image.open(os.path.join(images_dir, fn)).convert('RGB')
-        image_np = np.array(image)
+        image_np = np.array(image)                                # H×W×3
         img_t    = val_aug(image=image_np)['image'].float().unsqueeze(0).to(device)
         tokens   = tokenizer([CAPTION]).to(device)
 
+        # ── Prediction ────────────────────────────────────────────────────────
         pred_probs = tta_predict(model, img_t, tokens)
-        pred_np    = F.interpolate(pred_probs, size=(image.height, image.width),
-                                    mode='bilinear', align_corners=False
-                                    )[0, 0].cpu().numpy()
-        mask_u8    = (postprocess_mask(pred_np, threshold).astype(np.uint8) * 255)
-        mask_rgb   = Image.fromarray(mask_u8).convert('RGB')
+        pred_np    = F.interpolate(pred_probs,
+                                   size=(image.height, image.width),
+                                   mode='bilinear', align_corners=False
+                                   )[0, 0].cpu().numpy()
+        pred_bin   = postprocess_mask(pred_np, threshold)         # bool H×W
 
-        canvas = Image.new('RGB', (image.width * 2, image.height))
-        canvas.paste(image,    (0, 0))
-        canvas.paste(mask_rgb, (image.width, 0))
-        canvas.save(os.path.join(output_dir, fn))
+        # ── GT (optional) ─────────────────────────────────────────────────────
+        gt_bin = None
+        if masks_dir is not None:
+            gt_path = find_mask_path(masks_dir, fn)
+            if gt_path is not None:
+                gt_np  = np.array(Image.open(gt_path).convert('L'),
+                                  dtype=np.float32) / 255.0
+                gt_bin = gt_np > 0.5
 
-    print(f"[INFO] Saved {len(image_files)} output images")
+        # ── Figure layout ─────────────────────────────────────────────────────
+        n_cols = 3 if gt_bin is not None else 2
+        fig, axes = plt.subplots(1, n_cols,
+                                 figsize=(5.5 * n_cols, 5.5),
+                                 gridspec_kw={'wspace': 0.04})
+        fig.patch.set_facecolor('#1a1a1a')
+
+        # Panel 1 — original image
+        axes[0].imshow(image_np)
+        axes[0].set_title('Input', color='white', fontsize=11, pad=5)
+        axes[0].axis('off')
+
+        col = 1
+
+        # Panel 2 — GT overlay (green)
+        if gt_bin is not None:
+            axes[col].imshow(_make_overlay(image_np, gt_bin, (50, 220, 50)))
+            axes[col].set_title('Ground Truth', color='#32de84',
+                                fontsize=11, pad=5)
+            axes[col].axis('off')
+            col += 1
+
+        # Panel 3 — Prediction overlay (red) + per-image metrics
+        pred_title = 'Prediction'
+        if gt_bin is not None:
+            d = dice_score(pred_bin, gt_bin)
+            j = iou_score(pred_bin, gt_bin)
+            pred_title = f'Prediction    Dice {d:.3f}  ·  IoU {j:.3f}'
+
+        axes[col].imshow(_make_overlay(image_np, pred_bin, (220, 60, 60)))
+        axes[col].set_title(pred_title, color='#ff6b6b', fontsize=11, pad=5)
+        axes[col].axis('off')
+
+        # ── Save ──────────────────────────────────────────────────────────────
+        stem     = os.path.splitext(fn)[0]
+        out_path = os.path.join(output_dir, stem + '.png')
+        plt.savefig(out_path, dpi=150, bbox_inches='tight',
+                    facecolor=fig.get_facecolor())
+        plt.close(fig)
+        saved += 1
+
+    print(f"[INFO] Saved {saved} visualisation panels → {output_dir}")
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  TRAINING CURVES PLOT
@@ -1682,10 +1767,10 @@ def main():
             use_postprocess=True, use_tta=use_tta)
         test_results = {'dice': test_dice, 'iou': test_iou}
 
-        # Also save side-by-side visualisation images
+        # Also save side-by-side visualisation images (with GT panels)
         test_loop(model, args.test_img,
                   os.path.join(args.output_dir, 'test_outputs'),
-                  device, threshold=args.threshold)
+                  device, masks_dir=args.test_mask, threshold=args.threshold)
     elif has_test_imgs:
         print(f"\n[INFO] Test GT not found at {args.test_mask} — "
               "generating visual outputs only (no metrics)")
