@@ -74,6 +74,22 @@ OUTPUT_DIR             = os.path.join(BASE_DIR, 'outputs')
 # More specific dermoscopy caption (better CLIP alignment)
 CAPTION = "a dermoscopic image of a skin lesion with irregular border"
 
+# ── Multi-prompt bank ─────────────────────────────────────────────────────────
+# Diverse textual descriptions of skin lesions.  Each prompt is encoded
+# independently by the CLIP text encoder; their cosine-similarity maps with
+# the visual features are max-pooled so that ANY prompt that activates a
+# region (including small lesions) contributes to the final correlation map.
+SKIN_PROMPT_BANK = [
+    "a dermoscopic image of a skin lesion",
+    "melanoma with irregular borders and asymmetric pigmentation",
+    "a small malignant pigmented skin lesion",
+    "an atypical mole with varied coloration on dermoscopy",
+    "early stage skin cancer with dark irregular spots",
+    "a suspicious skin growth with satellite nodules or streaks",
+    "a dermoscopic view of a benign or malignant nevus",
+    "skin lesion showing regression areas or atypical vascular pattern",
+]
+
 IMAGE_EXTENSIONS = ('.jpg', '.jpeg', '.png', '.bmp', '.tif', '.tiff')
 CLIP_SIZE = 336    # ViT-B/16 native resolution — matches paper
 CLIP_MEAN = (0.48145466, 0.4578275,  0.40821073)
@@ -823,21 +839,88 @@ class ESCNet(nn.Module):
         proj = flat @ self.vis_proj_w                               # (B*H*W, 512)
         return F.normalize(proj.view(B, H, W, -1).permute(0, 3, 1, 2), dim=1)
 
+    # ─────────────────────────────────────────────────────────────────────────
+    #  Multi-prompt text bank
+    # ─────────────────────────────────────────────────────────────────────────
+    def setup_prompt_bank(self, bank_tokenizer, device,
+                          prompts=None):
+        """
+        Pre-encode a list of text prompts and register them as a non-trainable
+        buffer.  Must be called once after the model is moved to `device`.
+
+        Parameters
+        ----------
+        bank_tokenizer : callable
+            open_clip tokenizer (same one used for captions).
+        device : str or torch.device
+        prompts : list[str] | None
+            Defaults to SKIN_PROMPT_BANK.
+        """
+        if prompts is None:
+            prompts = SKIN_PROMPT_BANK
+        tokens = bank_tokenizer(prompts).to(device)          # (K, L)
+        with torch.no_grad():
+            embeds = self._encode_text(tokens)               # (K, 512)
+        # register_buffer keeps the tensor on the right device when model is
+        # moved, and excludes it from optimizer updates.
+        self.register_buffer('_bank_embeds', embeds)
+        print(f"[INFO] Prompt bank: {len(prompts)} descriptions encoded "
+              f"({embeds.shape[1]}-d CLIP embeddings)")
+
+    def _has_bank(self) -> bool:
+        return hasattr(self, '_bank_embeds') and self._bank_embeds is not None
+
+    # ─────────────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _minmax(t: torch.Tensor) -> torch.Tensor:
+        """Per-sample min-max normalisation over (H, W)."""
+        mn = t.flatten(1).min(1)[0].view(-1, 1, 1)
+        mx = t.flatten(1).max(1)[0].view(-1, 1, 1)
+        return (t - mn) / (mx - mn + 1e-6)
+
     def compute_corr(self, feats: dict, txt_embeds: torch.Tensor) -> torch.Tensor:
         """
         Compute normalised cosine-similarity correlation maps.
+
+        When a prompt bank has been set up via `setup_prompt_bank`, this
+        computes a correlation map for every bank prompt *plus* the per-sample
+        caption, then takes the element-wise maximum over all prompts.
+        The maximum aggregation ensures that even small lesion regions that
+        only respond to one specific prompt are not suppressed.
+
+        Without a bank it falls back to the original single-prompt behaviour.
+
         Returns (B, 2, H, W): [high-level corr, mid-level corr].
         """
-        def minmax(t):
-            mn = t.flatten(1).min(1)[0].view(-1, 1, 1)
-            mx = t.flatten(1).max(1)[0].view(-1, 1, 1)
-            return (t - mn) / (mx - mn + 1e-6)
+        high_proj = self._project_visual(feats['high'])   # (B, 512, H, W)
+        mid_proj  = self._project_visual(feats['mid'])    # (B, 512, H, W)
 
-        high_proj = self._project_visual(feats['high'])             # (B, 512, 21, 21)
-        mid_proj  = self._project_visual(feats['mid'])              # (B, 512, 21, 21)
+        if self._has_bank():
+            # ── Multi-prompt path ─────────────────────────────────────────────
+            # bank:   (K, 512)  — shared for all samples
+            # single: (B, 512)  — per-sample caption embedding
 
-        high_corr = minmax(torch.einsum('bchw,bc->bhw', high_proj, txt_embeds))
-        mid_corr  = minmax(torch.einsum('bchw,bc->bhw', mid_proj,  txt_embeds))
+            # Correlation with every bank prompt:  (B, K, H, W)
+            high_bank = torch.einsum('bchw,kc->bkhw', high_proj, self._bank_embeds)
+            mid_bank  = torch.einsum('bchw,kc->bkhw', mid_proj,  self._bank_embeds)
+
+            # Correlation with per-sample caption:  (B, 1, H, W)
+            high_cap  = torch.einsum('bchw,bc->bhw', high_proj, txt_embeds).unsqueeze(1)
+            mid_cap   = torch.einsum('bchw,bc->bhw', mid_proj,  txt_embeds).unsqueeze(1)
+
+            # Concatenate all K+1 maps and take the max over the prompt axis
+            # so any region activated by ANY prompt is preserved.
+            high_corr = torch.cat([high_bank, high_cap], dim=1).max(dim=1).values  # (B,H,W)
+            mid_corr  = torch.cat([mid_bank,  mid_cap],  dim=1).max(dim=1).values
+
+        else:
+            # ── Single-prompt fallback ────────────────────────────────────────
+            high_corr = torch.einsum('bchw,bc->bhw', high_proj, txt_embeds)  # (B,H,W)
+            mid_corr  = torch.einsum('bchw,bc->bhw', mid_proj,  txt_embeds)
+
+        high_corr = self._minmax(high_corr)
+        mid_corr  = self._minmax(mid_corr)
 
         H, W = feats['high'].shape[-2:]
         return torch.cat([
@@ -1442,8 +1525,10 @@ def parse_args():
     # Misc
     p.add_argument('--resume',       default=None,
                    help="Path to checkpoint to resume from")
-    p.add_argument('--no-tta',       action='store_true',
+    p.add_argument('--no-tta',         action='store_true',
                    help="Disable test-time augmentation during evaluation")
+    p.add_argument('--no-prompt-bank', action='store_true',
+                   help="Disable multi-prompt bank (use single caption only)")
     return p.parse_args()
 
 
@@ -1490,6 +1575,13 @@ def main():
     model = ESCNet(clip_model, sam,
                    num_blocks=args.num_blocks,
                    num_prompts=args.num_prompts).to(device)
+
+    # ── Multi-prompt bank  ────────────────────────────────────────────────────
+    # Pre-encode all prompts in the bank and attach them as a non-trainable
+    # buffer.  compute_corr() automatically uses them to build richer
+    # correlation maps via max-pooling over all K+1 text embeddings.
+    if not args.no_prompt_bank:
+        model.setup_prompt_bank(tokenizer, device)
 
     total = sum(p.numel() for p in model.parameters())
     print(f"[INFO] Model parameters: {total / 1e6:.1f} M")
