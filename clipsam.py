@@ -48,7 +48,7 @@ from sklearn.cluster import KMeans
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
 import cv2
-from torch.cuda.amp import autocast, GradScaler
+from torch.amp import autocast, GradScaler
 import matplotlib
 matplotlib.use('Agg')          # headless — no display needed on server
 import matplotlib.pyplot as plt
@@ -753,14 +753,23 @@ class ESCNet(nn.Module):
     def _tokens_to_spatial(self, tokens: torch.Tensor) -> torch.Tensor:
         """
         Convert ViT block output tokens to a spatial feature map.
-        tokens : (seq_len, B, C)  where seq_len = num_patches + 1  (CLS first)
+        Supports both token layouts used by different open_clip versions:
+          LND (legacy): (seq_len, B, C)  — CLS token at position [0]
+          NLD (newer):  (B, seq_len, C)  — CLS token at position [:, 0, :]
         Returns: (B, C, H, W)
         """
-        # Drop CLS token
-        patches = tokens[1:]                                  # (N, B, C)
-        B, C    = patches.shape[1], patches.shape[2]
-        # Reshape to spatial grid
-        return patches.permute(1, 2, 0).view(B, C, self.grid_h, self.grid_w)
+        num_tokens = self.grid_h * self.grid_w + 1   # patches + CLS
+
+        if tokens.shape[0] == num_tokens:
+            # ── LND format: (seq_len, B, C) ──────────────────────────────────
+            patches = tokens[1:]                         # (N_patches, B, C)
+            B, C    = patches.shape[1], patches.shape[2]
+            return patches.permute(1, 2, 0).view(B, C, self.grid_h, self.grid_w)
+        else:
+            # ── NLD format: (B, seq_len, C) ──────────────────────────────────
+            patches = tokens[:, 1:, :]                   # (B, N_patches, C)
+            B, _, C = patches.shape
+            return patches.permute(0, 2, 1).view(B, C, self.grid_h, self.grid_w)
 
     def _extract_clip_feats(self, x: torch.Tensor) -> dict:
         """
@@ -959,7 +968,7 @@ def train_loop(model, dataloader, optimizer, scheduler, device, epochs,
                save_path, pp_loss_weight=0.3, ds_weight=0.3, threshold=0.5):
     criterion  = CompoundLoss(w_tversky=0.6, w_focal=0.4, gamma=2.0,
                               tversky_alpha=0.7, tversky_beta=0.3)
-    scaler     = GradScaler()
+    scaler     = GradScaler('cuda')
     best_dice  = 0.0
     last_path  = save_path.replace('escnet_best.pth', 'escnet_last.pth')
 
@@ -977,7 +986,7 @@ def train_loop(model, dataloader, optimizer, scheduler, device, epochs,
             imgs, masks = imgs.to(device), masks.to(device)
             tokens      = tokenizer(caps).to(device)
 
-            with autocast():
+            with autocast('cuda'):
                 preds_logits, aux = model(imgs, tokens)
                 preds_r = F.interpolate(preds_logits, size=masks.shape[-2:],
                                         mode='bilinear', align_corners=False)
