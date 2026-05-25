@@ -33,6 +33,7 @@ Training improvements
 """
 
 import os
+import csv
 import json
 import argparse
 import math
@@ -86,9 +87,10 @@ train_aug = A.Compose([
     A.HorizontalFlip(p=0.5),
     A.VerticalFlip(p=0.5),
     A.RandomRotate90(p=0.5),
-    A.ShiftScaleRotate(shift_limit=0.05, scale_limit=0.15,
-                       rotate_limit=45, p=0.7,
-                       border_mode=cv2.BORDER_REFLECT_101),
+    # ShiftScaleRotate is a special case of Affine; use Affine directly (v2+)
+    A.Affine(translate_percent={"x": (-0.05, 0.05), "y": (-0.05, 0.05)},
+             scale=(0.85, 1.15), rotate=(-45, 45), p=0.7,
+             mode=cv2.BORDER_REFLECT_101),
     A.ElasticTransform(alpha=80, sigma=8, p=0.3),
     A.OneOf([
         A.GridDistortion(num_steps=5, distort_limit=0.3, p=1.0),
@@ -104,9 +106,12 @@ train_aug = A.Compose([
         A.MedianBlur(blur_limit=5, p=1.0),
         A.MotionBlur(p=1.0),
     ], p=0.3),
-    A.GaussNoise(var_limit=(10.0, 50.0), p=0.3),
-    A.CoarseDropout(max_holes=8, max_height=28, max_width=28,
-                    min_holes=1, fill_value=0, mask_fill_value=0, p=0.3),
+    # var_limit was removed in albumentations v2; std_range=(sqrt(10),sqrt(50))/255
+    A.GaussNoise(std_range=(0.012, 0.028), p=0.3),
+    # max_holes/fill_value API removed in albumentations v2
+    A.CoarseDropout(num_holes_range=(1, 8),
+                    hole_height_range=(1, 28), hole_width_range=(1, 28),
+                    fill=0, p=0.3),
     A.Normalize(mean=CLIP_MEAN, std=CLIP_STD),
     ToTensorV2(),
 ], additional_targets={'mask': 'mask'})
@@ -288,6 +293,15 @@ class CompoundLoss(nn.Module):
         edge_w = sobel_edge_weight(target, pred_logits.device)
         return (self.w_tversky * self.tversky(pred_logits, target) +
                 self.w_focal   * self.focal(pred_logits, target, weight=edge_w))
+
+    def forward_with_stats(self, pred_logits, target):
+        """Return (total_loss, dict) where dict has per-component scalar values.
+        Avoids recomputing Tversky/Focal twice compared to calling forward + sub-losses."""
+        edge_w  = sobel_edge_weight(target, pred_logits.device)
+        tv_loss = self.tversky(pred_logits, target)
+        fc_loss = self.focal(pred_logits, target, weight=edge_w)
+        total   = self.w_tversky * tv_loss + self.w_focal * fc_loss
+        return total, {'tversky': tv_loss.item(), 'focal': fc_loss.item()}
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  WINDOW ATTENTION BLOCK  (Swin-like, no timm dependency)
@@ -966,23 +980,47 @@ class WarmupCosineScheduler(torch.optim.lr_scheduler._LRScheduler):
 # ─────────────────────────────────────────────────────────────────────────────
 def train_loop(model, dataloader, optimizer, scheduler, device, epochs,
                save_path, pp_loss_weight=0.3, ds_weight=0.3, threshold=0.5):
+    """
+    Training loop with:
+      • Per-batch NaN/Inf loss guard (skips weight update, logs breakdown)
+      • Per-epoch component logging: Tversky, Focal, PP losses
+      • Gradient norm tracking (mean & max per epoch)
+      • AMP scale-drop counter (each drop = GradScaler detected overflow)
+      • CSV diagnostics file for post-hoc analysis
+    """
     criterion  = CompoundLoss(w_tversky=0.6, w_focal=0.4, gamma=2.0,
                               tversky_alpha=0.7, tversky_beta=0.3)
     scaler     = GradScaler('cuda')
     best_dice  = 0.0
     last_path  = save_path.replace('escnet_best.pth', 'escnet_last.pth')
+    diag_path  = save_path.replace('escnet_best.pth', 'training_diagnostics.csv')
 
     history = {'loss': [], 'dice': [], 'iou': [], 'lr': []}
 
+    # ── Write CSV header ──────────────────────────────────────────────────────
+    _fields = ['epoch', 'loss', 'loss_tversky', 'loss_focal', 'loss_pp',
+               'dice', 'iou', 'lr',
+               'grad_norm_mean', 'grad_norm_max',
+               'nan_batches', 'amp_scale_drops', 'amp_scale']
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    with open(diag_path, 'w', newline='') as _f:
+        csv.DictWriter(_f, fieldnames=_fields).writeheader()
+    print(f"[INFO] Diagnostics  → {diag_path}")
+
     print(f"\n{'Epoch':>6}  {'Loss':>8}  {'Dice':>8}  {'IoU':>8}  {'LR':>10}"
-          f"  {'Saved':>8}")
-    print("-" * 60)
+          f"  {'GradNorm':>9}  {'NaN/Skip':>8}  {'Saved':>8}")
+    print("-" * 80)
 
     for epoch in range(1, epochs + 1):
-        model.train()   # ← fixed: was `model.train()S` in original
-        total_loss, all_dice, all_iou = 0.0, [], []
+        model.train()
+        total_loss = 0.0
+        all_dice, all_iou = [], []
+        acc_tv, acc_fc, acc_pp = 0.0, 0.0, 0.0
+        grad_norms: list = []
+        nan_batches   = 0
+        amp_scale_drops = 0
 
-        for imgs, caps, masks, _ in dataloader:
+        for batch_idx, (imgs, caps, masks, _) in enumerate(dataloader):
             imgs, masks = imgs.to(device), masks.to(device)
             tokens      = tokenizer(caps).to(device)
 
@@ -990,24 +1028,49 @@ def train_loop(model, dataloader, optimizer, scheduler, device, epochs,
                 preds_logits, aux = model(imgs, tokens)
                 preds_r = F.interpolate(preds_logits, size=masks.shape[-2:],
                                         mode='bilinear', align_corners=False)
-                loss = criterion(preds_r, masks)
+
+                # Main loss — get component scalars at no extra compute cost
+                loss, _stats = criterion.forward_with_stats(preds_r, masks)
 
                 for ds_key in ('ds2', 'ds3'):
                     if aux.get(ds_key) is not None:
                         ds_r = F.interpolate(aux[ds_key], size=masks.shape[-2:],
                                              mode='bilinear', align_corners=False)
-                        loss += ds_weight * criterion(ds_r, masks)
+                        loss = loss + ds_weight * criterion(ds_r, masks)
 
-                loss += pp_loss_weight * _point_cls_loss(preds_r, masks, aux, device)
+                loss_pp = _point_cls_loss(preds_r, masks, aux, device)
+                loss    = loss + pp_loss_weight * loss_pp
 
+            # ── Guard: skip weight update when loss is non-finite ─────────────
+            if not torch.isfinite(loss):
+                nan_batches += 1
+                print(f"  [WARN] E{epoch:03d} B{batch_idx:04d}: "
+                      f"non-finite loss  "
+                      f"tv={_stats['tversky']:.4f}  "
+                      f"fc={_stats['focal']:.4f}  "
+                      f"pp={loss_pp.item():.4f}  — skipping update")
+                optimizer.zero_grad()
+                scaler.update()      # keep internal state consistent
+                continue
+
+            # ── Normal backward pass ──────────────────────────────────────────
+            prev_scale = scaler.get_scale()
             optimizer.zero_grad()
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            gn = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             scaler.step(optimizer)
             scaler.update()
 
+            if scaler.get_scale() < prev_scale:
+                amp_scale_drops += 1   # GradScaler detected overflow → skipped step
+
+            grad_norms.append(float(gn))
             total_loss += loss.item()
+            acc_tv     += _stats['tversky']
+            acc_fc     += _stats['focal']
+            acc_pp     += loss_pp.item()
+
             preds_probs = torch.sigmoid(preds_r)
             d, i = batch_dice_iou(preds_probs, masks, threshold)
             all_dice.append(d)
@@ -1015,19 +1078,34 @@ def train_loop(model, dataloader, optimizer, scheduler, device, epochs,
 
         scheduler.step()
 
-        n        = len(dataloader)
-        avg_loss = float(total_loss / n)
-        avg_dice = float(np.mean(all_dice))
-        avg_iou  = float(np.mean(all_iou))
+        n_valid  = max(len(dataloader) - nan_batches, 1)
+        avg_loss = float(total_loss / n_valid)
+        avg_dice = float(np.mean(all_dice) if all_dice else 0.0)
+        avg_iou  = float(np.mean(all_iou)  if all_iou  else 0.0)
+        avg_gn   = float(np.mean(grad_norms) if grad_norms else 0.0)
+        max_gn   = float(max(grad_norms)     if grad_norms else 0.0)
+        avg_tv   = float(acc_tv / n_valid)
+        avg_fc   = float(acc_fc / n_valid)
+        avg_pp   = float(acc_pp / n_valid)
         cur_lr   = float(optimizer.param_groups[0]['lr'])
+        amp_scale = float(scaler.get_scale())
 
         history['loss'].append(avg_loss)
         history['dice'].append(avg_dice)
         history['iou'] .append(avg_iou)
         history['lr']  .append(cur_lr)
 
+        # ── Append diagnostics row ────────────────────────────────────────────
+        row = {'epoch': epoch, 'loss': avg_loss,
+               'loss_tversky': avg_tv, 'loss_focal': avg_fc, 'loss_pp': avg_pp,
+               'dice': avg_dice, 'iou': avg_iou, 'lr': cur_lr,
+               'grad_norm_mean': avg_gn, 'grad_norm_max': max_gn,
+               'nan_batches': nan_batches,
+               'amp_scale_drops': amp_scale_drops, 'amp_scale': amp_scale}
+        with open(diag_path, 'a', newline='') as _f:
+            csv.DictWriter(_f, fieldnames=_fields).writerow(row)
+
         # ── Checkpoint: last epoch (always overwrite) ─────────────────────────
-        os.makedirs(os.path.dirname(save_path), exist_ok=True)
         last_payload = {
             'epoch': epoch, 'model_state': model.state_dict(),
             'optimizer_state': optimizer.state_dict(),
@@ -1043,11 +1121,14 @@ def train_loop(model, dataloader, optimizer, scheduler, device, epochs,
             torch.save(best_payload, save_path)
             saved_tag = "best+last"
 
+        nan_tag = f"{nan_batches}nan" if nan_batches else f"{amp_scale_drops}ovf"
         print(f"{epoch:>6}  {avg_loss:>8.4f}  {avg_dice:>8.4f}  "
-              f"{avg_iou:>8.4f}  {cur_lr:>10.2e}  {saved_tag:>8}")
+              f"{avg_iou:>8.4f}  {cur_lr:>10.2e}  "
+              f"{avg_gn:>9.3f}  {nan_tag:>8}  {saved_tag:>8}")
 
-    print(f"\n[INFO] Best Train Dice : {best_dice:.4f}  → {save_path}")
-    print(f"[INFO] Last checkpoint : epoch {epochs}    → {last_path}")
+    print(f"\n[INFO] Diagnostics CSV  : {diag_path}")
+    print(f"[INFO] Best Train Dice  : {best_dice:.4f}  → {save_path}")
+    print(f"[INFO] Last checkpoint  : epoch {epochs}    → {last_path}")
     return history
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1342,7 +1423,8 @@ def main():
         model_name='ViT-B-16',
         pretrained='openai',
         device=device,
-        force_image_size=args.clip_size)   # 336 × 336
+        force_image_size=args.clip_size,   # 336 × 336
+        force_quick_gelu=True)             # match OpenAI pretrained activation
 
     global tokenizer
     tokenizer = open_clip.get_tokenizer('ViT-B-16')
