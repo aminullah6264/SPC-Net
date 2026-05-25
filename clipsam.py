@@ -54,18 +54,20 @@ matplotlib.use('Agg')          # headless — no display needed on server
 import matplotlib.pyplot as plt
 import yaml
 
+from typing import Optional
+
 # ─────────────────────────────────────────────────────────────────────────────
 #  PATHS  (local server — extracted by setup_dataset.py)
 # ─────────────────────────────────────────────────────────────────────────────
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DATASET  = os.path.join(BASE_DIR, 'Dataset', 'extracted')
+DATASET  = '/mnt/data/users/av543f/datasets'
 
-IMG_PATH               = os.path.join(DATASET, 'trainx')
-MASK_PATH              = os.path.join(DATASET, 'trainy')
-VALIDATION_IMAGES_PATH = os.path.join(DATASET, 'validationx')
-VALIDATION_MASK_PATH   = os.path.join(DATASET, 'validationy')
-TEST_IMAGES_PATH       = os.path.join(DATASET, 'testx')
-TEST_MASK_PATH         = os.path.join(DATASET, 'testy')    # GT released by ISIC-2017
+IMG_PATH               = os.path.join(DATASET, 'ISIC-2017_Training_Data')
+MASK_PATH              = os.path.join(DATASET, 'ISIC-2017_Training_Part1_GroundTruth')
+VALIDATION_IMAGES_PATH = os.path.join(DATASET, 'ISIC-2017_Validation_Data')
+VALIDATION_MASK_PATH   = os.path.join(DATASET, 'ISIC-2017_Validation_Part1_GroundTruth')
+TEST_IMAGES_PATH       = os.path.join(DATASET, 'ISIC-2017_Test_v2_Data')
+TEST_MASK_PATH         = os.path.join(DATASET, 'ISIC-2017_Test_v2_Part1_GroundTruth')    # GT released by ISIC-2017
 OUTPUT_DIR             = os.path.join(BASE_DIR, 'outputs')
 
 # More specific dermoscopy caption (better CLIP alignment)
@@ -1168,12 +1170,17 @@ def save_training_plots(history: dict, output_dir: str):
     print(f"[INFO] Training curves saved → {out_path}")
 
 
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 #  RESULTS  YAML
 # ─────────────────────────────────────────────────────────────────────────────
-def save_results_yaml(history: dict, val_results: dict | None,
-                      test_results: dict | None,
-                      best_ckpt_info: dict, args, output_dir: str):
+def save_results_yaml(history: dict,
+                      val_results: Optional[dict],
+                      test_results: Optional[dict],
+                      best_ckpt_info: dict,
+                      args,
+                      output_dir: str):
     """
     Write a structured YAML file at <output_dir>/results.yaml that captures:
       • training config & per-epoch history
@@ -1215,7 +1222,6 @@ def save_results_yaml(history: dict, val_results: dict | None,
 
     if val_results is not None:
         doc['validation'] = arr_stats(val_results)
-
     if test_results is not None:
         doc['test'] = arr_stats(test_results)
 
@@ -1223,7 +1229,6 @@ def save_results_yaml(history: dict, val_results: dict | None,
     with open(out_path, 'w') as f:
         yaml.dump(doc, f, default_flow_style=False, sort_keys=False)
     print(f"[INFO] Results YAML saved  → {out_path}")
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  OPTIMISER  — dual learning rate

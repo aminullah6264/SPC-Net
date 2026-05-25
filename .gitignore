@@ -1,6 +1,6 @@
 arXiv-2411.14723v2/
 Dataset/
-
+outputs/
 # Python bytecode
 __pycache__/
 *.pyc
