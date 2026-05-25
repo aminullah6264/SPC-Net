@@ -1020,8 +1020,9 @@ def train_loop(model, dataloader, optimizer, scheduler, device, epochs,
         all_dice, all_iou = [], []
         acc_tv, acc_fc, acc_pp = 0.0, 0.0, 0.0
         grad_norms: list = []
-        nan_batches   = 0
+        nan_batches    = 0
         amp_scale_drops = 0
+        consecutive_nan = 0          # tracks run of bad batches
 
         for batch_idx, (imgs, caps, masks, _) in enumerate(dataloader):
             imgs, masks = imgs.to(device), masks.to(device)
@@ -1034,12 +1035,28 @@ def train_loop(model, dataloader, optimizer, scheduler, device, epochs,
                 # All-NaN tv/fc/pp means preds_r was already NaN (model issue,
                 # not a loss-function edge case).
                 if not torch.isfinite(preds_logits).all():
-                    nan_batches += 1
+                    nan_batches    += 1
+                    consecutive_nan += 1
                     n_nan = (~torch.isfinite(preds_logits)).sum().item()
                     print(f"  [WARN] E{epoch:03d} B{batch_idx:04d}: "
                           f"NaN/Inf in model output ({n_nan} values) — "
-                          f"skipping batch without backward")
+                          f"skipping batch (streak={consecutive_nan})")
                     optimizer.zero_grad()
+
+                    # ── Checkpoint recovery ───────────────────────────────────
+                    # 3+ consecutive NaN batches means weights are corrupted.
+                    # Reload the last saved best checkpoint so training can
+                    # continue instead of wasting the rest of the epoch.
+                    if consecutive_nan >= 3 and os.path.exists(save_path):
+                        ckpt_r = torch.load(save_path, map_location=device,
+                                            weights_only=False)
+                        model.load_state_dict(ckpt_r['model_state'])
+                        optimizer.load_state_dict(ckpt_r['optimizer_state'])
+                        print(f"  [RECOVER] Reloaded best ckpt "
+                              f"(epoch {ckpt_r['epoch']}, "
+                              f"dice={ckpt_r.get('best_dice', 0):.4f})")
+                        consecutive_nan = 0   # reset streak after reload
+
                     continue            # ← no scaler.update(); backward never called
 
                 preds_r = F.interpolate(preds_logits, size=masks.shape[-2:],
@@ -1083,6 +1100,7 @@ def train_loop(model, dataloader, optimizer, scheduler, device, epochs,
             if scaler.get_scale() < prev_scale:
                 amp_scale_drops += 1   # GradScaler detected overflow → skipped step
 
+            consecutive_nan = 0        # successful update → reset streak
             grad_norms.append(float(gn))
             total_loss += loss.item()
             acc_tv     += _stats['tversky']
