@@ -990,7 +990,10 @@ def train_loop(model, dataloader, optimizer, scheduler, device, epochs,
     """
     criterion  = CompoundLoss(w_tversky=0.6, w_focal=0.4, gamma=2.0,
                               tversky_alpha=0.7, tversky_beta=0.3)
-    scaler     = GradScaler('cuda')
+    # init_scale=4096: the default (65536) dropped 4× in epoch 1 every run,
+    # so pre-set it to the stable value.  growth_interval=2000 avoids
+    # re-growing aggressively and triggering new overflows.
+    scaler     = GradScaler('cuda', init_scale=4096.0, growth_interval=2000)
     best_dice  = 0.0
     last_path  = save_path.replace('escnet_best.pth', 'escnet_last.pth')
     diag_path  = save_path.replace('escnet_best.pth', 'training_diagnostics.csv')
@@ -1026,6 +1029,19 @@ def train_loop(model, dataloader, optimizer, scheduler, device, epochs,
 
             with autocast('cuda'):
                 preds_logits, aux = model(imgs, tokens)
+
+                # ── Detect NaN in model output before touching the loss ────────
+                # All-NaN tv/fc/pp means preds_r was already NaN (model issue,
+                # not a loss-function edge case).
+                if not torch.isfinite(preds_logits).all():
+                    nan_batches += 1
+                    n_nan = (~torch.isfinite(preds_logits)).sum().item()
+                    print(f"  [WARN] E{epoch:03d} B{batch_idx:04d}: "
+                          f"NaN/Inf in model output ({n_nan} values) — "
+                          f"skipping batch without backward")
+                    optimizer.zero_grad()
+                    continue            # ← no scaler.update(); backward never called
+
                 preds_r = F.interpolate(preds_logits, size=masks.shape[-2:],
                                         mode='bilinear', align_corners=False)
 
@@ -1041,7 +1057,7 @@ def train_loop(model, dataloader, optimizer, scheduler, device, epochs,
                 loss_pp = _point_cls_loss(preds_r, masks, aux, device)
                 loss    = loss + pp_loss_weight * loss_pp
 
-            # ── Guard: skip weight update when loss is non-finite ─────────────
+            # ── Guard: non-finite scalar loss (loss-function edge case) ────────
             if not torch.isfinite(loss):
                 nan_batches += 1
                 print(f"  [WARN] E{epoch:03d} B{batch_idx:04d}: "
@@ -1050,7 +1066,9 @@ def train_loop(model, dataloader, optimizer, scheduler, device, epochs,
                       f"fc={_stats['focal']:.4f}  "
                       f"pp={loss_pp.item():.4f}  — skipping update")
                 optimizer.zero_grad()
-                scaler.update()      # keep internal state consistent
+                # scaler.update() must NOT be called here — backward was never
+                # called so the scaler has no inf-checks recorded and would
+                # raise: "No inf checks were recorded prior to update."
                 continue
 
             # ── Normal backward pass ──────────────────────────────────────────
