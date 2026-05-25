@@ -88,6 +88,8 @@ SKIN_PROMPT_BANK = [
     "a suspicious skin growth with satellite nodules or streaks",
     "a dermoscopic view of a benign or malignant nevus",
     "skin lesion showing regression areas or atypical vascular pattern",
+    "a photo of skin lesion",
+    "a photo of skin diseases"
 ]
 
 IMAGE_EXTENSIONS = ('.jpg', '.jpeg', '.png', '.bmp', '.tif', '.tiff')
@@ -100,34 +102,34 @@ CLIP_STD  = (0.26862954, 0.26130258, 0.27577711)
 # ─────────────────────────────────────────────────────────────────────────────
 train_aug = A.Compose([
     A.Resize(CLIP_SIZE, CLIP_SIZE),
-    A.HorizontalFlip(p=0.5),
-    A.VerticalFlip(p=0.5),
-    A.RandomRotate90(p=0.5),
+    A.HorizontalFlip(p=0.3),
+    A.VerticalFlip(p=0.2),
+    A.RandomRotate90(p=0.3),
     # ShiftScaleRotate is a special case of Affine; use Affine directly (v2+)
     A.Affine(translate_percent={"x": (-0.05, 0.05), "y": (-0.05, 0.05)},
-             scale=(0.85, 1.15), rotate=(-45, 45), p=0.7,
+             scale=(0.85, 1.15), rotate=(-45, 45), p=0.4,
              mode=cv2.BORDER_REFLECT_101),
     A.ElasticTransform(alpha=80, sigma=8, p=0.3),
     A.OneOf([
-        A.GridDistortion(num_steps=5, distort_limit=0.3, p=1.0),
-        A.OpticalDistortion(distort_limit=0.3, p=1.0),
+        A.GridDistortion(num_steps=5, distort_limit=0.3, p=0.5),
+        A.OpticalDistortion(distort_limit=0.3, p=0.5),
     ], p=0.3),
-    A.RandomBrightnessContrast(brightness_limit=0.3, contrast_limit=0.3, p=0.6),
+    A.RandomBrightnessContrast(brightness_limit=0.3, contrast_limit=0.3, p=0.3),
     A.HueSaturationValue(hue_shift_limit=15, sat_shift_limit=30,
-                         val_shift_limit=20, p=0.5),
+                         val_shift_limit=20, p=0.2),
     A.RGBShift(r_shift_limit=15, g_shift_limit=15, b_shift_limit=15, p=0.3),
     A.CLAHE(clip_limit=4.0, p=0.3),
     A.OneOf([
-        A.GaussianBlur(blur_limit=(3, 7), p=1.0),
-        A.MedianBlur(blur_limit=5, p=1.0),
-        A.MotionBlur(p=1.0),
-    ], p=0.3),
+        A.GaussianBlur(blur_limit=(3, 7), p=0.4),
+        A.MedianBlur(blur_limit=5, p=0.2),
+        A.MotionBlur(p=0.3),
+    ], p=0.2),
     # var_limit was removed in albumentations v2; std_range=(sqrt(10),sqrt(50))/255
-    A.GaussNoise(std_range=(0.012, 0.028), p=0.3),
+    A.GaussNoise(std_range=(0.012, 0.028), p=0.2),
     # max_holes/fill_value API removed in albumentations v2
     A.CoarseDropout(num_holes_range=(1, 8),
                     hole_height_range=(1, 28), hole_width_range=(1, 28),
-                    fill=0, p=0.3),
+                    fill=0, p=0.1),
     A.Normalize(mean=CLIP_MEAN, std=CLIP_STD),
     ToTensorV2(),
 ], additional_targets={'mask': 'mask'})
@@ -1197,7 +1199,7 @@ def train_loop(model, dataloader, optimizer, scheduler, device, epochs,
             optimizer.zero_grad()
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
-            gn = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
+            gn = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
             scaler.step(optimizer)
             scaler.update()
 
