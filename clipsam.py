@@ -713,6 +713,9 @@ class ESCNet(nn.Module):
             img_sz = self.clip_visual.image_size
         else:
             img_sz = CLIP_SIZE
+        # image_size can be an int or a (H, W) tuple depending on open_clip version
+        if isinstance(img_sz, (tuple, list)):
+            img_sz = img_sz[0]
         patch_sz = 16   # ViT-B/16
         self.grid_h = self.grid_w = img_sz // patch_sz   # = 21
 
@@ -1330,7 +1333,7 @@ def main():
         model_name='ViT-B-16',
         pretrained='openai',
         device=device,
-        image_size=args.clip_size)   # 336 × 336
+        force_image_size=args.clip_size)   # 336 × 336
 
     global tokenizer
     tokenizer = open_clip.get_tokenizer('ViT-B-16')
