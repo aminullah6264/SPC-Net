@@ -1365,6 +1365,86 @@ def train_loop(model, dataloader, optimizer, scheduler, device, epochs,
     return history
 
 # ─────────────────────────────────────────────────────────────────────────────
+#  THRESHOLD CALIBRATION  (run once on validation, reuse on test)
+# ─────────────────────────────────────────────────────────────────────────────
+def calibrate_threshold(model, images_dir, masks_dir, device,
+                        candidates=None, use_tta=True):
+    """Sweep candidate thresholds on a held-out split and return the one that
+    maximises mean Dice.
+
+    Inference runs **once** — sigmoid probability maps are cached in memory,
+    then every candidate threshold is evaluated offline.  This is fast and
+    avoids the bias of using the same fixed 0.5 threshold on the test set.
+
+    Args:
+        candidates: list of floats to try (default: 0.10 → 0.90 step 0.05)
+
+    Returns:
+        (best_threshold: float, best_mean_dice: float)
+    """
+    if candidates is None:
+        candidates = [round(t, 2) for t in np.arange(0.10, 0.91, 0.05).tolist()]
+
+    fallback = (0.50, 0.0)
+    if not (os.path.isdir(images_dir) and os.path.isdir(masks_dir)):
+        print("[WARN] calibrate_threshold: images or masks dir missing; "
+              "defaulting threshold to 0.50")
+        return fallback
+
+    model.eval()
+    preds_np, gts_bin = [], []
+    image_files = sorted([f for f in os.listdir(images_dir)
+                          if f.lower().endswith(IMAGE_EXTENSIONS)])
+
+    print(f"\n[INFO] Calibrating threshold — running inference on "
+          f"{len(image_files)} validation images …")
+
+    for fn in image_files:
+        mask_path = find_mask_path(masks_dir, fn)
+        if mask_path is None:
+            continue
+
+        image  = np.array(Image.open(os.path.join(images_dir, fn)).convert('RGB'))
+        img_t  = val_aug(image=image)['image'].float().unsqueeze(0).to(device)
+        gt_np  = np.array(Image.open(mask_path).convert('L'),
+                          dtype=np.float32) / 255.0
+        tokens = tokenizer([CAPTION]).to(device)
+
+        if use_tta:
+            prob = tta_predict(model, img_t, tokens)
+        else:
+            with torch.no_grad():
+                logits, _ = model(img_t, tokens)
+                prob = torch.sigmoid(logits)
+
+        pred_np = F.interpolate(prob, size=gt_np.shape,
+                                mode='bilinear', align_corners=False
+                                )[0, 0].cpu().numpy()
+        preds_np.append(pred_np)
+        gts_bin.append(gt_np > 0.5)
+
+    if not preds_np:
+        print("[WARN] calibrate_threshold: no paired images found; "
+              "defaulting threshold to 0.50")
+        return fallback
+
+    best_thresh, best_dice = 0.50, -1.0
+    print(f"  {'Thresh':>7}  {'Mean Dice':>10}  {'Mean IoU':>10}")
+    for t in candidates:
+        dices = [dice_score(p > t, g) for p, g in zip(preds_np, gts_bin)]
+        ious  = [iou_score (p > t, g) for p, g in zip(preds_np, gts_bin)]
+        md, mi = float(np.mean(dices)), float(np.mean(ious))
+        marker  = "  ←" if md > best_dice else ""
+        print(f"   {t:.2f}      {md:.4f}      {mi:.4f}{marker}")
+        if md > best_dice:
+            best_dice, best_thresh = md, t
+
+    print(f"[INFO] Best threshold : {best_thresh:.2f}  "
+          f"(val Dice {best_dice:.4f})")
+    return float(best_thresh), float(best_dice)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 #  EVALUATION LOOP
 # ─────────────────────────────────────────────────────────────────────────────
 def evaluate_loop(model, images_dir, masks_dir, device,
@@ -1591,10 +1671,12 @@ def save_results_yaml(history: dict,
                       test_results: Optional[dict],
                       best_ckpt_info: dict,
                       args,
-                      output_dir: str):
+                      output_dir: str,
+                      calibrated_threshold: Optional[float] = None):
     """
     Write a structured YAML file at <output_dir>/results.yaml that captures:
       • training config & per-epoch history
+      • calibrated threshold (val-optimal) and fixed threshold
       • validation metrics (mean, std, best, worst Dice / IoU)
       • test metrics (same)
     """
@@ -1615,7 +1697,7 @@ def save_results_yaml(history: dict,
         'training': {
             'best_epoch':      int(best_ckpt_info.get('epoch', -1)),
             'best_train_dice': float(f"{best_ckpt_info.get('best_dice', 0):.6f}"),
-            'total_epochs':    int(args.epochs),
+            'total_epochs':    int(args.epochs) if not getattr(args, 'test_only', False) else 0,
             'batch_size':      int(args.batch_size),
             'lr_pretrained':   float(args.lr_pretrained),
             'lr_new':          float(args.lr_new),
@@ -1628,6 +1710,13 @@ def save_results_yaml(history: dict,
             'epoch_loss': [round(v, 6) for v in history['loss']],
             'epoch_dice': [round(v, 6) for v in history['dice']],
             'epoch_iou':  [round(v, 6) for v in history['iou']],
+        },
+        'threshold': {
+            'calibrated': round(calibrated_threshold, 4) if calibrated_threshold is not None
+                          else None,
+            'fixed_arg':  float(args.threshold),
+            'note': ('calibrated on validation set; applied to both val and test'
+                     if calibrated_threshold is not None else 'fixed CLI value'),
         },
     }
 
@@ -1724,6 +1813,10 @@ def parse_args():
     # Misc
     p.add_argument('--resume',       default=None,
                    help="Path to checkpoint to resume from")
+    p.add_argument('--test-only',    action='store_true',
+                   help="Skip training: load checkpoint (--resume, or escnet_best.pth "
+                        "in --output-dir) and run threshold calibration + val/test "
+                        "evaluation only.  No dataset or optimiser is constructed.")
     p.add_argument('--no-tta',         action='store_true',
                    help="Disable test-time augmentation during evaluation")
     p.add_argument('--no-prompt-bank', action='store_true',
@@ -1759,127 +1852,158 @@ def main():
     tokenizer = open_clip.get_tokenizer('ViT-B-16')
 
     # ── SAM ViT-B  ────────────────────────────────────────────────────────────
-    ckpt = os.path.join(args.output_dir, 'sam_vit_b.pth')
-    download_sam_checkpoint(ckpt)
+    sam_ckpt = os.path.join(args.output_dir, 'sam_vit_b.pth')
+    download_sam_checkpoint(sam_ckpt)
     print("[INFO] Loading SAM ViT-B …")
-    sam = sam_model_registry['vit_b'](checkpoint=ckpt).to(device)
-
-    # ── Captions  ─────────────────────────────────────────────────────────────
-    captions_path = os.path.join(args.img_path, 'captions.json')
-    if not os.path.exists(captions_path):
-        captions = generate_captions(args.img_path, CAPTION, captions_path)
-    else:
-        with open(captions_path) as f:
-            captions = json.load(f)
-        print(f"[INFO] Loaded captions.json ({len(captions)} entries)")
-
-    # ── Dataset & loader  ─────────────────────────────────────────────────────
-    train_ds = ISICDataset(args.img_path, args.mask_path, captions, augment=True)
-    train_dl = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
-                          num_workers=args.num_workers, pin_memory=True,
-                          drop_last=True)
+    sam = sam_model_registry['vit_b'](checkpoint=sam_ckpt).to(device)
 
     # ── Model  ────────────────────────────────────────────────────────────────
     model = ESCNet(clip_model, sam,
                    num_blocks=args.num_blocks,
                    num_prompts=args.num_prompts).to(device)
 
-    # ── Multi-prompt bank  ────────────────────────────────────────────────────
-    # Pre-encode all prompts in the bank and attach them as a non-trainable
-    # buffer.  compute_corr() automatically uses them to build richer
-    # correlation maps via max-pooling over all K+1 text embeddings.
     if not args.no_prompt_bank:
         model.setup_prompt_bank(tokenizer, device)
 
     total = sum(p.numel() for p in model.parameters())
     print(f"[INFO] Model parameters: {total / 1e6:.1f} M")
 
-    # ── Optimiser (dual LR) + scheduler  ─────────────────────────────────────
-    optimizer = build_optimizer(
-        model, clip_model, sam,
-        lr_pretrained=args.lr_pretrained,
-        lr_new=args.lr_new,
-        weight_decay=args.weight_decay)
-
-    scheduler = WarmupCosineScheduler(
-        optimizer,
-        warmup_epochs=args.warmup_ep,
-        total_epochs=args.epochs,
-        milestones=args.milestones,
-        milestone_decay=args.milestone_decay,
-        eta_min=1e-6)
-
-    # ── Resume from checkpoint  ───────────────────────────────────────────────
     best_path = os.path.join(args.output_dir, 'escnet_best.pth')
-    if args.resume and os.path.exists(args.resume):
-        ckpt_data = torch.load(args.resume, map_location=device)
-        model.load_state_dict(ckpt_data['model_state'])
-        optimizer.load_state_dict(ckpt_data['optimizer_state'])
-        resumed_epoch = ckpt_data.get('epoch', 1)
-        print(f"[INFO] Resumed from epoch {resumed_epoch} "
-              f"(best Dice: {ckpt_data.get('best_dice', 0):.4f})")
+    use_tta   = not args.no_tta
+    history   = {'loss': [], 'dice': [], 'iou': [], 'lr': []}
 
-    # ── Train  ────────────────────────────────────────────────────────────────
-    history = train_loop(
-        model, train_dl, optimizer, scheduler, device,
-        epochs=args.epochs,
-        save_path=best_path,
-        pp_loss_weight=0.3, ds_weight=0.3,
-        threshold=args.threshold)
+    # ═════════════════════════════════════════════════════════════════════════
+    #  TEST-ONLY PATH  — skip dataset/optimiser/training entirely
+    # ═════════════════════════════════════════════════════════════════════════
+    if args.test_only:
+        ckpt_path = args.resume if args.resume else best_path
+        if not os.path.exists(ckpt_path):
+            raise FileNotFoundError(
+                f"[ERROR] No checkpoint found at '{ckpt_path}'.\n"
+                "  Pass --resume <path> to specify one, or ensure "
+                "escnet_best.pth exists in --output-dir.")
+        eval_ckpt = torch.load(ckpt_path, map_location=device)
+        model.load_state_dict(eval_ckpt['model_state'])
+        print(f"[INFO] Loaded checkpoint: {ckpt_path}")
+        print(f"       epoch {eval_ckpt.get('epoch', '?')}, "
+              f"Dice {eval_ckpt.get('best_dice', 0):.4f}")
 
-    # ── Save training curves  ─────────────────────────────────────────────────
-    save_training_plots(history, args.output_dir)
+    # ═════════════════════════════════════════════════════════════════════════
+    #  FULL TRAINING PATH
+    # ═════════════════════════════════════════════════════════════════════════
+    else:
+        # ── Captions ─────────────────────────────────────────────────────────
+        captions_path = os.path.join(args.img_path, 'captions.json')
+        if not os.path.exists(captions_path):
+            captions = generate_captions(args.img_path, CAPTION, captions_path)
+        else:
+            with open(captions_path) as f:
+                captions = json.load(f)
+            print(f"[INFO] Loaded captions.json ({len(captions)} entries)")
 
-    # ── Reload best checkpoint for evaluation  ────────────────────────────────
-    best_ckpt = torch.load(best_path, map_location=device)
-    model.load_state_dict(best_ckpt['model_state'])
-    print(f"\n[INFO] Best checkpoint loaded — epoch {best_ckpt['epoch']}, "
-          f"train Dice {best_ckpt['best_dice']:.4f}")
+        # ── Dataset & loader ─────────────────────────────────────────────────
+        train_ds = ISICDataset(args.img_path, args.mask_path, captions,
+                               augment=True)
+        train_dl = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
+                              num_workers=args.num_workers, pin_memory=True,
+                              drop_last=True)
 
-    use_tta = not args.no_tta
+        # ── Optimiser (dual LR) + scheduler ──────────────────────────────────
+        optimizer = build_optimizer(
+            model, clip_model, sam,
+            lr_pretrained=args.lr_pretrained,
+            lr_new=args.lr_new,
+            weight_decay=args.weight_decay)
 
-    # ── Validation evaluation  ────────────────────────────────────────────────
+        scheduler = WarmupCosineScheduler(
+            optimizer,
+            warmup_epochs=args.warmup_ep,
+            total_epochs=args.epochs,
+            milestones=args.milestones,
+            milestone_decay=args.milestone_decay,
+            eta_min=1e-6)
+
+        # ── Resume from checkpoint ────────────────────────────────────────────
+        if args.resume and os.path.exists(args.resume):
+            ckpt_data = torch.load(args.resume, map_location=device)
+            model.load_state_dict(ckpt_data['model_state'])
+            optimizer.load_state_dict(ckpt_data['optimizer_state'])
+            resumed_epoch = ckpt_data.get('epoch', 1)
+            print(f"[INFO] Resumed from epoch {resumed_epoch} "
+                  f"(best Dice: {ckpt_data.get('best_dice', 0):.4f})")
+
+        # ── Train ─────────────────────────────────────────────────────────────
+        history = train_loop(
+            model, train_dl, optimizer, scheduler, device,
+            epochs=args.epochs,
+            save_path=best_path,
+            pp_loss_weight=0.3, ds_weight=0.3,
+            threshold=args.threshold)
+
+        save_training_plots(history, args.output_dir)
+
+        # ── Reload best checkpoint ────────────────────────────────────────────
+        eval_ckpt = torch.load(best_path, map_location=device)
+        model.load_state_dict(eval_ckpt['model_state'])
+        print(f"\n[INFO] Best checkpoint loaded — epoch {eval_ckpt['epoch']}, "
+              f"train Dice {eval_ckpt['best_dice']:.4f}")
+
+    # ═════════════════════════════════════════════════════════════════════════
+    #  SHARED EVALUATION  (both training and test-only paths)
+    # ═════════════════════════════════════════════════════════════════════════
+
+    # ── Calibrate threshold on validation set ────────────────────────────────
+    # Run inference once on val, sweep candidate thresholds, pick the best one.
+    # This threshold is then reused on the test set — never tuned on test data.
+    cal_thresh, _cal_dice = calibrate_threshold(
+        model, args.val_img, args.val_mask, device, use_tta=use_tta)
+
+    # ── Validation evaluation (with calibrated threshold) ────────────────────
     val_dice, val_iou = evaluate_loop(
         model, args.val_img, args.val_mask, device,
-        threshold=args.threshold, split_name="Validation",
+        threshold=cal_thresh, split_name="Validation",
         use_postprocess=True, use_tta=use_tta)
     val_results = {'dice': val_dice, 'iou': val_iou}
 
-    # ── Test evaluation (GT is available for ISIC-2017)  ──────────────────────
-    test_results = None
+    # ── Test evaluation (GT available for ISIC-2017) ──────────────────────────
+    test_results   = None
     has_test_imgs  = os.path.isdir(args.test_img)  and bool(os.listdir(args.test_img))
     has_test_masks = os.path.isdir(args.test_mask) and bool(os.listdir(args.test_mask))
 
     if has_test_imgs and has_test_masks:
         test_dice, test_iou = evaluate_loop(
             model, args.test_img, args.test_mask, device,
-            threshold=args.threshold, split_name="Test",
+            threshold=cal_thresh, split_name="Test",
             use_postprocess=True, use_tta=use_tta)
         test_results = {'dice': test_dice, 'iou': test_iou}
 
-        # Also save side-by-side visualisation images (with GT panels)
         test_loop(model, args.test_img,
                   os.path.join(args.output_dir, 'test_outputs'),
-                  device, masks_dir=args.test_mask, threshold=args.threshold)
+                  device, masks_dir=args.test_mask, threshold=cal_thresh)
     elif has_test_imgs:
         print(f"\n[INFO] Test GT not found at {args.test_mask} — "
               "generating visual outputs only (no metrics)")
         test_loop(model, args.test_img,
                   os.path.join(args.output_dir, 'test_outputs'),
-                  device, threshold=args.threshold)
+                  device, threshold=cal_thresh)
     else:
         print(f"\n[INFO] Test images not found at {args.test_img} — skipping test")
 
-    # ── Save results YAML  ────────────────────────────────────────────────────
+    # ── Save results YAML ─────────────────────────────────────────────────────
     save_results_yaml(history, val_results, test_results,
-                      best_ckpt_info=best_ckpt, args=args,
-                      output_dir=args.output_dir)
+                      best_ckpt_info=eval_ckpt, args=args,
+                      output_dir=args.output_dir,
+                      calibrated_threshold=cal_thresh)
 
     print("\n[DONE] All outputs written to:", args.output_dir)
-    print("  escnet_best.pth        — best training-Dice checkpoint")
-    print("  escnet_last.pth        — last epoch checkpoint")
-    print("  training_curves.png    — loss / Dice / IoU plots")
-    print("  results.yaml           — validation & test metrics")
+    if not args.test_only:
+        print("  escnet_best.pth        — best training-Dice checkpoint")
+        print("  escnet_last.pth        — last epoch checkpoint")
+        print("  escnet_clean.pth       — last zero-NaN checkpoint")
+        print("  training_curves.png    — loss / Dice / IoU plots")
+        print("  training_diagnostics.csv")
+    print(f"  threshold used         — {cal_thresh:.2f} (calibrated on val set)")
+    print("  results.yaml           — val & test metrics + threshold info")
     if has_test_imgs:
         print("  test_outputs/          — side-by-side visualisations")
 
