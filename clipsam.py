@@ -492,47 +492,55 @@ class SAMBlock(nn.Module):
                            SAM's decoder cross-attention was trained with.
             input_points : (B, P, 2)    pseudo point prompts from PPG
             input_labels : (B, P)       point labels (all 1 = foreground)
-            input_masks  : (B, P, H, W) pseudo mask prompts from PPG
-            out_hw       : (H, W) target spatial resolution — must match
-                           feat_maps['high'] so the output slots back in.
+            input_masks  : (B, P, H_in, W_in) pseudo mask prompts from PPG
+            out_hw       : (H_out, W_out) target spatial resolution for the
+                           output — must match feat_maps['high'] so the result
+                           slots back into the ESCNet feature pyramid.
         Returns:
-            (B, feature_dim, H, W) — refined features in CLIP feature space
+            (B, feature_dim, H_out, W_out)
         """
-        device = sam_embed.device
-        B      = sam_embed.shape[0]
-        P      = input_points.shape[1]
-        H, W   = out_hw
+        device       = sam_embed.device
+        B            = sam_embed.shape[0]
+        P            = input_points.shape[1]
+        Hs, Ws       = sam_embed.shape[-2:]   # SAM native resolution (64×64)
+        H_out, W_out = out_hw                 # CLIP spatial resolution (21×21)
 
-        # ── Resize SAM embeddings to the CLIP feature resolution ─────────────
-        # SAM encoder outputs at 64×64 (for 1024-px input); cross-attention
-        # runs at CLIP's 21×21 to stay aligned with VLFBlock / FPN decoder.
-        feat_sam = F.interpolate(
-            sam_embed.float(), size=(H, W),
-            mode='bilinear', align_corners=False
-        ).to(sam_embed.dtype)                                          # (B, sam_dim, H, W)
+        # ── Cross-attention runs at SAM's NATIVE 64×64 resolution ────────────
+        # We keep sam_embed as-is instead of downsampling it to 21×21.
+        # This preserves the full spatial detail that SAM's encoder computed.
+        # The PPG masks (21×21) are upsampled to 64×64 to match.
+        # The output is downsampled back to 21×21 only at the very end so
+        # the rest of the pipeline (VLFBlock, FPN decoder) is unaffected.
+        feat_sam = sam_embed.float()                                   # (B, sam_dim, Hs, Ws)
+
+        # ── Upsample PPG mask prompts to SAM resolution ───────────────────────
+        H_in, W_in = input_masks.shape[-2:]
+        masks_f = F.interpolate(
+            input_masks.to(device).reshape(B * P, 1, H_in, W_in).float(),
+            size=(Hs, Ws), mode='bilinear', align_corners=False)       # (B*P, 1, Hs, Ws)
 
         # ── Encode pseudo prompts ─────────────────────────────────────────────
-        pts_f   = input_points.to(device).reshape(B * P, 1, 2).float()
-        lbl_f   = input_labels.to(device).reshape(B * P).unsqueeze(1).float()
-        masks_f = input_masks.to(device).reshape(B * P, 1, H, W).float()
+        pts_f  = input_points.to(device).reshape(B * P, 1, 2).float()
+        lbl_f  = input_labels.to(device).reshape(B * P).unsqueeze(1).float()
 
         sparse_emb, dense_emb = self.prompt_encoder(
             points=(pts_f, lbl_f), boxes=None, masks=masks_f)
 
-        # ── Reshape prompt embeddings ─────────────────────────────────────────
+        # ── Reshape prompt embeddings to SAM resolution ───────────────────────
         T          = sparse_emb.shape[1]
         sparse_emb = sparse_emb.view(B, P, T, self.sam_dim)           # (B, P, T, sam_dim)
-        dense_emb  = F.interpolate(dense_emb, size=(H, W),
+        dense_emb  = F.interpolate(dense_emb, size=(Hs, Ws),
                                    mode='bilinear', align_corners=False)
-        dense_emb  = dense_emb.view(B, P, self.sam_dim, H, W)         # (B, P, sam_dim, H, W)
+        dense_emb  = dense_emb.view(B, P, self.sam_dim, Hs, Ws)       # (B, P, sam_dim, Hs, Ws)
 
         # ── Image tokens for bidirectional cross-attention ────────────────────
-        img_tokens = feat_sam.flatten(2).permute(0, 2, 1)             # (B, H*W, sam_dim)
+        # 4096 tokens (64×64) vs 441 (21×21) — more spatial detail, more compute
+        img_tokens = feat_sam.flatten(2).permute(0, 2, 1)             # (B, Hs*Ws, sam_dim)
 
         out_list = []
         for n in range(P):
             pt = sparse_emb[:, n]                                      # (B, T, sam_dim)
-            de = dense_emb[:, n]                                       # (B, sam_dim, H, W)
+            de = dense_emb[:, n]                                       # (B, sam_dim, Hs, Ws)
 
             # 1) Prompt self-attention
             pt_sa = self.decoder_block.self_attn(pt, pt, pt)          # (B, T, sam_dim)
@@ -543,17 +551,24 @@ class SAMBlock(nn.Module):
 
             # 3) Image-to-token cross-attention  (SAM image queries, prompt K/V)
             ir = self.decoder_block.cross_attn_image_to_token(
-                img_tokens, pt_t2i, pt_t2i)                           # (B, H*W, sam_dim)
+                img_tokens, pt_t2i, pt_t2i)                           # (B, Hs*Ws, sam_dim)
 
             # Reshape to spatial map and blend with dense prompt embedding.
-            xmap = ir.permute(0, 2, 1).view(B, self.sam_dim, H, W)
+            xmap = ir.permute(0, 2, 1).view(B, self.sam_dim, Hs, Ws)  # (B, sam_dim, 64, 64)
             out_list.append((xmap + de * feat_sam).clamp(-100, 100))
 
         # Pad unused prompt slots with zeros
         while len(out_list) < self.num_prompts:
             out_list.append(torch.zeros_like(out_list[0]))
 
-        return self.conv(torch.cat(out_list[:self.num_prompts], dim=1))  # (B, feat_dim, H, W)
+        # ── Downsample from SAM resolution back to CLIP feature resolution ──────
+        # Cross-attention ran at 64×64 to exploit SAM's full spatial detail.
+        # The concatenated multi-prompt tensor is resized to out_hw (21×21)
+        # before the final 1×1 projection so the output shape is unchanged.
+        cat_out = torch.cat(out_list[:self.num_prompts], dim=1)        # (B, sam_dim*P, Hs, Ws)
+        cat_out = F.interpolate(cat_out, size=(H_out, W_out),
+                                mode='bilinear', align_corners=False)  # (B, sam_dim*P, H_out, W_out)
+        return self.conv(cat_out.to(sam_embed.dtype))                  # (B, feat_dim, H_out, W_out)
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  VISION-LANGUAGE FUSION BLOCK
