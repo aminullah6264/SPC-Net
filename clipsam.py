@@ -478,62 +478,78 @@ class SAMBlock(nn.Module):
         sam_dim             = sam_decoder_block.self_attn.q_proj.in_features
         self.sam_dim        = sam_dim
         self.num_prompts    = num_prompts
-        # Project CLIP features → SAM embedding dim
-        self.proj  = nn.Conv2d(feature_dim, sam_dim, kernel_size=1)
+        # NOTE: self.proj (CLIP→SAM) is intentionally absent.
+        # SAM's own image encoder now supplies features already in sam_dim space.
         # Fuse per-prompt outputs back to feature_dim
         self.conv  = nn.Conv2d(sam_dim * num_prompts, feature_dim, kernel_size=1)
 
-    def forward(self, feat_map, input_points, input_labels, input_masks):
-        device     = feat_map.device
-        B, _, H, W = feat_map.shape
-        P          = input_points.shape[1]
+    def forward(self, sam_embed, input_points, input_labels, input_masks, out_hw):
+        """
+        Args:
+            sam_embed    : (B, sam_dim, Hs, Ws) — image embeddings from SAM's
+                           own image_encoder (typically 256 × 64 × 64).
+                           These are in the same representation space that
+                           SAM's decoder cross-attention was trained with.
+            input_points : (B, P, 2)    pseudo point prompts from PPG
+            input_labels : (B, P)       point labels (all 1 = foreground)
+            input_masks  : (B, P, H, W) pseudo mask prompts from PPG
+            out_hw       : (H, W) target spatial resolution — must match
+                           feat_maps['high'] so the output slots back in.
+        Returns:
+            (B, feature_dim, H, W) — refined features in CLIP feature space
+        """
+        device = sam_embed.device
+        B      = sam_embed.shape[0]
+        P      = input_points.shape[1]
+        H, W   = out_hw
 
-        # Project features to SAM space
-        feat_sam   = self.proj(feat_map)                               # (B, sam_dim, H, W)
+        # ── Resize SAM embeddings to the CLIP feature resolution ─────────────
+        # SAM encoder outputs at 64×64 (for 1024-px input); cross-attention
+        # runs at CLIP's 21×21 to stay aligned with VLFBlock / FPN decoder.
+        feat_sam = F.interpolate(
+            sam_embed.float(), size=(H, W),
+            mode='bilinear', align_corners=False
+        ).to(sam_embed.dtype)                                          # (B, sam_dim, H, W)
 
-        # Flatten prompt dims for SAM prompt encoder (treats each prompt separately)
-        pts_f  = input_points.to(device).reshape(B * P, 1, 2).float()
-        lbl_f  = input_labels.to(device).reshape(B * P).unsqueeze(1).float()
+        # ── Encode pseudo prompts ─────────────────────────────────────────────
+        pts_f   = input_points.to(device).reshape(B * P, 1, 2).float()
+        lbl_f   = input_labels.to(device).reshape(B * P).unsqueeze(1).float()
         masks_f = input_masks.to(device).reshape(B * P, 1, H, W).float()
 
         sparse_emb, dense_emb = self.prompt_encoder(
             points=(pts_f, lbl_f), boxes=None, masks=masks_f)
 
-        # Reshape prompt embeddings
+        # ── Reshape prompt embeddings ─────────────────────────────────────────
         T          = sparse_emb.shape[1]
         sparse_emb = sparse_emb.view(B, P, T, self.sam_dim)           # (B, P, T, sam_dim)
         dense_emb  = F.interpolate(dense_emb, size=(H, W),
                                    mode='bilinear', align_corners=False)
         dense_emb  = dense_emb.view(B, P, self.sam_dim, H, W)         # (B, P, sam_dim, H, W)
 
-        # Image tokens for attention
+        # ── Image tokens for bidirectional cross-attention ────────────────────
         img_tokens = feat_sam.flatten(2).permute(0, 2, 1)             # (B, H*W, sam_dim)
 
         out_list = []
         for n in range(P):
-            pt  = sparse_emb[:, n]                                     # (B, T, sam_dim)
-            de  = dense_emb[:, n]                                      # (B, sam_dim, H, W)
+            pt = sparse_emb[:, n]                                      # (B, T, sam_dim)
+            de = dense_emb[:, n]                                       # (B, sam_dim, H, W)
 
             # 1) Prompt self-attention
             pt_sa = self.decoder_block.self_attn(pt, pt, pt)          # (B, T, sam_dim)
 
-            # 2) Token-to-image cross-attention  (prompt queries, image K/V)
-            #    Prompts gather spatial context from image features
+            # 2) Token-to-image cross-attention  (prompt queries, SAM image K/V)
             pt_t2i = self.decoder_block.cross_attn_token_to_image(
                 pt_sa, img_tokens, img_tokens)                         # (B, T, sam_dim)
 
-            # 3) Image-to-token cross-attention  (image queries, prompt K/V)
-            #    Image features are refined by prompt information
+            # 3) Image-to-token cross-attention  (SAM image queries, prompt K/V)
             ir = self.decoder_block.cross_attn_image_to_token(
                 img_tokens, pt_t2i, pt_t2i)                           # (B, H*W, sam_dim)
 
-            # Reshape to spatial map and blend with dense prompt.
-            # Clamp prevents fp16 overflow from the de*feat_sam product
-            # accumulating over many training steps.
+            # Reshape to spatial map and blend with dense prompt embedding.
             xmap = ir.permute(0, 2, 1).view(B, self.sam_dim, H, W)
             out_list.append((xmap + de * feat_sam).clamp(-100, 100))
 
-        # Pad if fewer prompts were generated than num_prompts
+        # Pad unused prompt slots with zeros
         while len(out_list) < self.num_prompts:
             out_list.append(torch.zeros_like(out_list[0]))
 
@@ -609,11 +625,15 @@ class ESCBlock(nn.Module):
                                   feature_dim, num_prompts)
         self.vlf       = VLFBlock(feature_dim, text_dim)
 
-    def forward(self, feat_maps, text_embeds, corr_maps):
-        # Use the first correlation channel (high-level) to guide PPG
+    def forward(self, feat_maps, text_embeds, corr_maps, sam_embed):
+        """
+        sam_embed: (B, 256, 64, 64) — SAM image embeddings from ESCNet.
+                   Passed through unchanged; SAMBlock resizes internally.
+        """
         pts, labels, masks = self.ppg(corr_maps[:, 0])
-        feat_ref           = self.sam_block(feat_maps['high'], pts, labels, masks)
-        corr_ref           = self.vlf(corr_maps, feat_ref, text_embeds)
+        H, W     = feat_maps['high'].shape[-2:]   # CLIP spatial resolution (e.g. 21×21)
+        feat_ref = self.sam_block(sam_embed, pts, labels, masks, out_hw=(H, W))
+        corr_ref = self.vlf(corr_maps, feat_ref, text_embeds)
         new_feats = {**feat_maps, 'high': feat_ref}
         return new_feats, corr_ref, (pts, labels)
 
@@ -795,6 +815,28 @@ class ESCNet(nn.Module):
             for i in range(num_blocks)
         ])
 
+        # ── SAM image encoder (frozen) ────────────────────────────────────────
+        # Store SAM's ViT image encoder so each ESCBlock receives native SAM
+        # image embeddings (256-d, 64×64) rather than projected CLIP features.
+        # Kept frozen: the encoder is large (~91 M for ViT-B) and its weights
+        # are tightly coupled to the decoder cross-attention it was trained with.
+        self.sam_image_encoder = sam_model.image_encoder
+        for p in self.sam_image_encoder.parameters():
+            p.requires_grad = False
+
+        # Normalisation constants for converting a CLIP-normalised image tensor
+        # into the pixel range expected by SAM's image encoder.
+        # CLIP: mean=[0.4815, 0.4578, 0.4082], std=[0.2686, 0.2613, 0.2758]
+        # SAM:  mean=[0.4850, 0.4560, 0.4059], std=[0.2290, 0.2240, 0.2250]
+        self.register_buffer('_clip_mean',
+            torch.tensor([0.48145466, 0.45782750, 0.40821073]).view(1, 3, 1, 1))
+        self.register_buffer('_clip_std',
+            torch.tensor([0.26862954, 0.26130258, 0.27577711]).view(1, 3, 1, 1))
+        self.register_buffer('_sam_mean',
+            torch.tensor([0.48500, 0.45600, 0.40590]).view(1, 3, 1, 1))
+        self.register_buffer('_sam_std',
+            torch.tensor([0.22900, 0.22400, 0.22500]).view(1, 3, 1, 1))
+
         # ── FPN decoder  (all ViT skip dims = 768) ────────────────────────────
         self.mask_decoder = MaskDecoder(
             feature_dim = self.VIT_FEAT_DIM,
@@ -831,6 +873,24 @@ class ESCNet(nn.Module):
             patches = tokens[:, 1:, :]                   # (B, N_patches, C)
             B, _, C = patches.shape
             return patches.permute(0, 2, 1).view(B, C, self.grid_h, self.grid_w)
+
+    def _prepare_sam_image(self, clip_image: torch.Tensor) -> torch.Tensor:
+        """Convert a CLIP-normalised image tensor to SAM-normalised 1024×1024.
+
+        SAM's image encoder (ViT-B) was trained on 1024×1024 inputs with
+        ImageNet-style normalisation.  CLIP uses a slightly different
+        normalisation and a 336×336 input.  This method:
+          1. Undoes CLIP normalisation → [0, 1] pixel range
+          2. Applies SAM normalisation
+          3. Resizes to 1024×1024 (required by SAM's window attention)
+
+        Returns float32 tensor regardless of input dtype so the frozen
+        encoder always runs in stable full precision.
+        """
+        img_01  = clip_image.float() * self._clip_std + self._clip_mean   # → [0, 1]
+        img_sam = (img_01 - self._sam_mean) / self._sam_std               # SAM range
+        return F.interpolate(img_sam, size=(1024, 1024),
+                             mode='bilinear', align_corners=False)
 
     def _extract_clip_feats(self, x: torch.Tensor) -> dict:
         """
@@ -967,9 +1027,17 @@ class ESCNet(nn.Module):
         txt_embeds = self._encode_text(text_tokens)
         corr       = self.compute_corr(img_feats, txt_embeds)
 
+        # ── SAM image embeddings (computed once, shared by all ESCBlocks) ─────
+        # The encoder is frozen so no gradient is needed here.  Running in
+        # float32 prevents any fp16 instability inside the large ViT.
+        with torch.no_grad():
+            sam_embed = self.sam_image_encoder(
+                self._prepare_sam_image(image))                        # (B, 256, 64, 64)
+
         pp_points = pp_labels = pp_size = None
         for i, block in enumerate(self.esc_blocks):
-            img_feats, corr, (pts, labels) = block(img_feats, txt_embeds, corr)
+            img_feats, corr, (pts, labels) = block(img_feats, txt_embeds, corr,
+                                                    sam_embed)
             if i == 0:
                 pp_points, pp_labels, pp_size = pts, labels, corr.shape[-2:]
 
