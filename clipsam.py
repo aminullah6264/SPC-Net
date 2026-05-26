@@ -1444,9 +1444,91 @@ def calibrate_threshold(model, images_dir, masks_dir, device,
     return float(best_thresh), float(best_dice)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  EVALUATION LOOP
-# ─────────────────────────────────────────────────────────────────────────────
+def threshold_sweep(model, images_dir, masks_dir, device,
+                    candidates=None, use_tta=True,
+                    highlight_thresh=None, split_name="Test"):
+    """Evaluate *split* at every candidate threshold and return a list of row dicts.
+
+    Inference runs once; all candidates are evaluated offline from cached
+    probability maps.  Pass ``highlight_thresh`` to mark the val-calibrated
+    value in the printed table.
+
+    Saves nothing — caller writes the CSV.
+    """
+    if candidates is None:
+        candidates = [round(t, 2) for t in np.arange(0.10, 0.91, 0.05).tolist()]
+
+    model.eval()
+    preds_np, gts_bin = [], []
+    image_files = sorted([f for f in os.listdir(images_dir)
+                          if f.lower().endswith(IMAGE_EXTENSIONS)])
+
+    print(f"\n[INFO] Threshold sweep — collecting {split_name} predictions "
+          f"({len(image_files)} images) …")
+
+    for fn in image_files:
+        mask_path = find_mask_path(masks_dir, fn)
+        if mask_path is None:
+            continue
+        image  = np.array(Image.open(os.path.join(images_dir, fn)).convert('RGB'))
+        img_t  = val_aug(image=image)['image'].float().unsqueeze(0).to(device)
+        gt_np  = np.array(Image.open(mask_path).convert('L'),
+                          dtype=np.float32) / 255.0
+        tokens = tokenizer([CAPTION]).to(device)
+
+        if use_tta:
+            prob = tta_predict(model, img_t, tokens)
+        else:
+            with torch.no_grad():
+                logits, _ = model(img_t, tokens)
+                prob = torch.sigmoid(logits)
+
+        pred_np = F.interpolate(prob, size=gt_np.shape,
+                                mode='bilinear', align_corners=False
+                                )[0, 0].cpu().numpy()
+        preds_np.append(pred_np)
+        gts_bin.append(gt_np > 0.5)
+
+    if not preds_np:
+        print(f"[WARN] threshold_sweep: no paired images in {split_name}; skipping")
+        return []
+
+    rows = []
+    print(f"\n  Threshold sweep — {split_name}  ({len(preds_np)} images)")
+    print(f"  {'Thresh':>7}  {'MeanDice':>9}  {'StdDice':>8}  "
+          f"{'BestDice':>9}  {'MeanIoU':>8}  note")
+    print("  " + "─" * 62)
+
+    for t in candidates:
+        dices = np.array([dice_score(p > t, g) for p, g in zip(preds_np, gts_bin)])
+        ious  = np.array([iou_score (p > t, g) for p, g in zip(preds_np, gts_bin)])
+        md, sd, bd = dices.mean(), dices.std(), dices.max()
+        mi         = ious.mean()
+        note = " ← val-calibrated" if (highlight_thresh is not None
+                                        and abs(t - highlight_thresh) < 1e-9) else ""
+        print(f"   {t:.2f}     {md:.4f}   {sd:.4f}    {bd:.4f}   {mi:.4f}{note}")
+        rows.append({
+            'threshold': t,
+            'mean_dice': round(float(md), 6),
+            'std_dice':  round(float(sd), 6),
+            'best_dice': round(float(bd), 6),
+            'mean_iou':  round(float(mi), 6),
+            'std_iou':   round(float(ious.std()), 6),
+        })
+
+    best_row = max(rows, key=lambda r: r['mean_dice'])
+    print(f"\n  Best on {split_name}: threshold={best_row['threshold']:.2f}  "
+          f"Dice={best_row['mean_dice']:.4f}")
+    if highlight_thresh is not None:
+        cal_row = next((r for r in rows
+                        if abs(r['threshold'] - highlight_thresh) < 1e-9), None)
+        if cal_row:
+            print(f"  Val-calibrated  : threshold={cal_row['threshold']:.2f}  "
+                  f"Dice={cal_row['mean_dice']:.4f}  "
+                  f"(Δ = {cal_row['mean_dice'] - best_row['mean_dice']:+.4f} vs test-best)")
+    return rows
+
+
 def evaluate_loop(model, images_dir, masks_dir, device,
                   threshold=0.5, split_name="", use_postprocess=True,
                   use_tta=True):
@@ -1821,6 +1903,10 @@ def parse_args():
                    help="Disable test-time augmentation during evaluation")
     p.add_argument('--no-prompt-bank', action='store_true',
                    help="Disable multi-prompt bank (use single caption only)")
+    p.add_argument('--threshold-sweep', action='store_true',
+                   help="After main evaluation, sweep all candidate thresholds "
+                        "on the test set and save per-threshold Dice/IoU to "
+                        "threshold_sweep_test.csv.  Requires test GT masks.")
     # LR milestones
     p.add_argument('--milestones', nargs='+', type=float, default=[0.5, 0.75],
                    metavar='F',
@@ -1976,6 +2062,23 @@ def main():
             threshold=cal_thresh, split_name="Test",
             use_postprocess=True, use_tta=use_tta)
         test_results = {'dice': test_dice, 'iou': test_iou}
+
+        # ── Optional threshold sweep on test set ──────────────────────────
+        if args.threshold_sweep:
+            sweep_rows = threshold_sweep(
+                model, args.test_img, args.test_mask, device,
+                use_tta=use_tta, highlight_thresh=cal_thresh,
+                split_name="Test")
+            if sweep_rows:
+                sweep_csv = os.path.join(args.output_dir,
+                                         'threshold_sweep_test.csv')
+                _fields = ['threshold', 'mean_dice', 'std_dice',
+                           'best_dice', 'mean_iou', 'std_iou']
+                with open(sweep_csv, 'w', newline='') as _f:
+                    w = csv.DictWriter(_f, fieldnames=_fields)
+                    w.writeheader()
+                    w.writerows(sweep_rows)
+                print(f"[INFO] Threshold sweep saved → {sweep_csv}")
 
         test_loop(model, args.test_img,
                   os.path.join(args.output_dir, 'test_outputs'),
