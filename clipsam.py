@@ -400,10 +400,13 @@ class PseudoPromptGenerator(nn.Module):
     pseudo mask prompts via softmax → binarise → K-means clustering.
     (Paper §3.2  "Pseudo Prompt Generator")
     """
-    def __init__(self, threshold=0.1, num_regions=5):
+    def __init__(self, threshold=0.1, num_regions=5,
+                 top_fraction=0.15, min_pixels=None):
         super().__init__()
-        self.threshold   = threshold
-        self.num_regions = num_regions
+        self.threshold    = threshold
+        self.num_regions  = num_regions
+        self.top_fraction = top_fraction  # fraction of map used as fallback floor
+        self.min_pixels   = min_pixels    # explicit pixel floor (None → computed)
 
     def forward(self, corr_maps):
         # corr_maps: (B, H, W)
@@ -414,17 +417,34 @@ class PseudoPromptGenerator(nn.Module):
         all_masks  = torch.zeros(B, P, H, W, dtype=torch.uint8)
 
         for b in range(B):
-            prob     = F.softmax(corr_maps[b].detach().cpu().reshape(-1), dim=0).view(H, W)
-            bin_mask = (prob > self.threshold).numpy().astype(np.uint8)
-            coords   = np.column_stack(np.nonzero(bin_mask))
+            prob    = F.softmax(corr_maps[b].detach().cpu().reshape(-1), dim=0).view(H, W)
+            prob_np = prob.numpy()
 
-            if len(coords) == 0:
-                # Fallback: single centre point
-                all_points[b, 0] = torch.tensor([W // 2, H // 2], dtype=torch.float32)
-                all_labels[b, 0] = 1
-                all_masks [b, 0] = torch.from_numpy(bin_mask)
-                continue
+            # ── Step 1: fixed-threshold binarisation ─────────────────────────
+            bin_mask = (prob_np > self.threshold).astype(np.uint8)
 
+            # ── Step 2: adaptive fallback — guarantee at least min_pix pixels ─
+            # After softmax over H×W pixels the average probability is ~1/(H*W).
+            # threshold=0.1 requires 44× the average to activate, so flat/diffuse
+            # correlation maps (early training, small lesions) yield zero pixels.
+            # When that happens we fall back to the top top_fraction of the map
+            # so SAMBlock always receives substantive spatial guidance.
+            min_pix = (self.min_pixels
+                       if self.min_pixels is not None
+                       else max(self.num_regions * 4, int(self.top_fraction * H * W)))
+
+            if int(bin_mask.sum()) < min_pix:
+                n_select = max(min_pix, int(self.top_fraction * H * W))
+                flat     = prob_np.ravel()
+                # argpartition is O(N) — faster than a full sort
+                topk_idx = np.argpartition(flat, -n_select)[-n_select:]
+                bin_mask = np.zeros(H * W, dtype=np.uint8)
+                bin_mask[topk_idx] = 1
+                bin_mask = bin_mask.reshape(H, W)
+
+            # coords is now GUARANTEED non-empty: softmax always has a positive
+            # maximum so top-K always selects something.
+            coords     = np.column_stack(np.nonzero(bin_mask))
             n_clusters = min(P, len(coords))
             km = KMeans(n_clusters=n_clusters, n_init=10, random_state=0).fit(coords)
 
