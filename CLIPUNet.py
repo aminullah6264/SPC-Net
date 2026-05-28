@@ -95,8 +95,7 @@ def build_train_aug(size):
         A.VerticalFlip(p=0.2),
         A.RandomRotate90(p=0.3),
         A.Affine(translate_percent={"x": (-0.05, 0.05), "y": (-0.05, 0.05)},
-                 scale=(0.85, 1.15), rotate=(-45, 45), p=0.4,
-                 mode=cv2.BORDER_REFLECT_101),
+                 scale=(0.85, 1.15), rotate=(-45, 45), p=0.4),
         A.ElasticTransform(alpha=80, sigma=8, p=0.3),
         A.OneOf([
             A.GridDistortion(num_steps=5, distort_limit=0.3, p=0.5),
@@ -369,11 +368,8 @@ class DiceLoss(nn.Module):
 class BoundaryLoss(nn.Module):
     """
     Edge-weighted BCE.  A Laplacian extracts GT boundaries; BCE is then
-    averaged ONLY over boundary pixels.
-
-    Fixes the student's bug: `probs*edges + 1e-6` could exceed 1.0 and crash
-    F.binary_cross_entropy (inputs must be in [0,1]).  Here probs are clamped
-    and BCE is computed elementwise then masked, so it is always valid.
+    averaged ONLY over boundary pixels.  Uses binary_cross_entropy_with_logits
+    which is AMP-safe (applies sigmoid internally).
     """
     def __init__(self):
         super().__init__()
@@ -386,8 +382,8 @@ class BoundaryLoss(nn.Module):
         kernel = self.kernel.to(device=logits.device, dtype=logits.dtype)
         tgt    = targets.to(dtype=logits.dtype)
         edges  = (F.conv2d(tgt, kernel, padding=1).abs() > 0).to(logits.dtype)
-        probs  = torch.sigmoid(logits).clamp(1e-6, 1.0 - 1e-6)
-        bce    = F.binary_cross_entropy(probs, tgt, reduction='none')
+        # binary_cross_entropy_with_logits is AMP-safe and applies sigmoid internally
+        bce    = F.binary_cross_entropy_with_logits(logits, tgt, reduction='none')
         return (bce * edges).sum() / (edges.sum() + 1e-6)
 
 
