@@ -33,6 +33,7 @@ Training improvements
 """
 
 import os
+import csv
 import json
 import argparse
 import math
@@ -48,7 +49,7 @@ from sklearn.cluster import KMeans
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
 import cv2
-from torch.cuda.amp import autocast, GradScaler
+from torch.amp import autocast, GradScaler
 import matplotlib
 matplotlib.use('Agg')          # headless — no display needed on server
 import matplotlib.pyplot as plt
@@ -73,6 +74,24 @@ OUTPUT_DIR             = os.path.join(BASE_DIR, 'outputs')
 # More specific dermoscopy caption (better CLIP alignment)
 CAPTION = "a dermoscopic image of a skin lesion with irregular border"
 
+# ── Multi-prompt bank ─────────────────────────────────────────────────────────
+# Diverse textual descriptions of skin lesions.  Each prompt is encoded
+# independently by the CLIP text encoder; their cosine-similarity maps with
+# the visual features are max-pooled so that ANY prompt that activates a
+# region (including small lesions) contributes to the final correlation map.
+SKIN_PROMPT_BANK = [
+    "a dermoscopic image of a skin lesion",
+    "melanoma with irregular borders and asymmetric pigmentation",
+    "a small malignant pigmented skin lesion",
+    "an atypical mole with varied coloration on dermoscopy",
+    "early stage skin cancer with dark irregular spots",
+    "a suspicious skin growth with satellite nodules or streaks",
+    "a dermoscopic view of a benign or malignant nevus",
+    "skin lesion showing regression areas or atypical vascular pattern",
+    "a photo of skin lesion",
+    "a photo of skin diseases"
+]
+
 IMAGE_EXTENSIONS = ('.jpg', '.jpeg', '.png', '.bmp', '.tif', '.tiff')
 CLIP_SIZE = 336    # ViT-B/16 native resolution — matches paper
 CLIP_MEAN = (0.48145466, 0.4578275,  0.40821073)
@@ -83,30 +102,34 @@ CLIP_STD  = (0.26862954, 0.26130258, 0.27577711)
 # ─────────────────────────────────────────────────────────────────────────────
 train_aug = A.Compose([
     A.Resize(CLIP_SIZE, CLIP_SIZE),
-    A.HorizontalFlip(p=0.5),
-    A.VerticalFlip(p=0.5),
-    A.RandomRotate90(p=0.5),
-    A.ShiftScaleRotate(shift_limit=0.05, scale_limit=0.15,
-                       rotate_limit=45, p=0.7,
-                       border_mode=cv2.BORDER_REFLECT_101),
+    A.HorizontalFlip(p=0.3),
+    A.VerticalFlip(p=0.2),
+    A.RandomRotate90(p=0.3),
+    # ShiftScaleRotate is a special case of Affine; use Affine directly (v2+)
+    A.Affine(translate_percent={"x": (-0.05, 0.05), "y": (-0.05, 0.05)},
+             scale=(0.85, 1.15), rotate=(-45, 45), p=0.4,
+             mode=cv2.BORDER_REFLECT_101),
     A.ElasticTransform(alpha=80, sigma=8, p=0.3),
     A.OneOf([
-        A.GridDistortion(num_steps=5, distort_limit=0.3, p=1.0),
-        A.OpticalDistortion(distort_limit=0.3, p=1.0),
+        A.GridDistortion(num_steps=5, distort_limit=0.3, p=0.5),
+        A.OpticalDistortion(distort_limit=0.3, p=0.5),
     ], p=0.3),
-    A.RandomBrightnessContrast(brightness_limit=0.3, contrast_limit=0.3, p=0.6),
+    A.RandomBrightnessContrast(brightness_limit=0.3, contrast_limit=0.3, p=0.3),
     A.HueSaturationValue(hue_shift_limit=15, sat_shift_limit=30,
-                         val_shift_limit=20, p=0.5),
+                         val_shift_limit=20, p=0.2),
     A.RGBShift(r_shift_limit=15, g_shift_limit=15, b_shift_limit=15, p=0.3),
     A.CLAHE(clip_limit=4.0, p=0.3),
     A.OneOf([
-        A.GaussianBlur(blur_limit=(3, 7), p=1.0),
-        A.MedianBlur(blur_limit=5, p=1.0),
-        A.MotionBlur(p=1.0),
-    ], p=0.3),
-    A.GaussNoise(var_limit=(10.0, 50.0), p=0.3),
-    A.CoarseDropout(max_holes=8, max_height=28, max_width=28,
-                    min_holes=1, fill_value=0, mask_fill_value=0, p=0.3),
+        A.GaussianBlur(blur_limit=(3, 7), p=0.4),
+        A.MedianBlur(blur_limit=5, p=0.2),
+        A.MotionBlur(p=0.3),
+    ], p=0.2),
+    # var_limit was removed in albumentations v2; std_range=(sqrt(10),sqrt(50))/255
+    A.GaussNoise(std_range=(0.012, 0.028), p=0.2),
+    # max_holes/fill_value API removed in albumentations v2
+    A.CoarseDropout(num_holes_range=(1, 8),
+                    hole_height_range=(1, 28), hole_width_range=(1, 28),
+                    fill=0, p=0.1),
     A.Normalize(mean=CLIP_MEAN, std=CLIP_STD),
     ToTensorV2(),
 ], additional_targets={'mask': 'mask'})
@@ -289,6 +312,15 @@ class CompoundLoss(nn.Module):
         return (self.w_tversky * self.tversky(pred_logits, target) +
                 self.w_focal   * self.focal(pred_logits, target, weight=edge_w))
 
+    def forward_with_stats(self, pred_logits, target):
+        """Return (total_loss, dict) where dict has per-component scalar values.
+        Avoids recomputing Tversky/Focal twice compared to calling forward + sub-losses."""
+        edge_w  = sobel_edge_weight(target, pred_logits.device)
+        tv_loss = self.tversky(pred_logits, target)
+        fc_loss = self.focal(pred_logits, target, weight=edge_w)
+        total   = self.w_tversky * tv_loss + self.w_focal * fc_loss
+        return total, {'tversky': tv_loss.item(), 'focal': fc_loss.item()}
+
 # ─────────────────────────────────────────────────────────────────────────────
 #  WINDOW ATTENTION BLOCK  (Swin-like, no timm dependency)
 #
@@ -342,9 +374,16 @@ class WindowAttentionBlock(nn.Module):
         x_hwc = x.permute(0, 2, 3, 1)
 
         # Window attention with residual
+        # Force float32: the concat input is 1536-d (768+768) and QK^T in
+        # fp16 with d_head=192 regularly overflows after ~20 epochs of
+        # weight drift, producing all-NaN outputs.
         shortcut = x_hwc
         wins, B_, H_, W_, Hp, Wp = self._partition(self.norm1(x_hwc))
-        attn_out, _ = self.attn(wins, wins, wins, need_weights=False)
+        orig_dtype = wins.dtype
+        attn_out, _ = self.attn(
+            wins.float(), wins.float(), wins.float(),
+            need_weights=False)
+        attn_out = attn_out.to(orig_dtype)
         x_hwc = self._reverse(attn_out, B_, H_, W_, Hp, Wp) + shortcut
 
         # MLP with residual
@@ -468,9 +507,11 @@ class SAMBlock(nn.Module):
             ir = self.decoder_block.cross_attn_image_to_token(
                 img_tokens, pt_t2i, pt_t2i)                           # (B, H*W, sam_dim)
 
-            # Reshape to spatial map and blend with dense prompt
+            # Reshape to spatial map and blend with dense prompt.
+            # Clamp prevents fp16 overflow from the de*feat_sam product
+            # accumulating over many training steps.
             xmap = ir.permute(0, 2, 1).view(B, self.sam_dim, H, W)
-            out_list.append(xmap + de * feat_sam)
+            out_list.append((xmap + de * feat_sam).clamp(-100, 100))
 
         # Pad if fewer prompts were generated than num_prompts
         while len(out_list) < self.num_prompts:
@@ -713,6 +754,9 @@ class ESCNet(nn.Module):
             img_sz = self.clip_visual.image_size
         else:
             img_sz = CLIP_SIZE
+        # image_size can be an int or a (H, W) tuple depending on open_clip version
+        if isinstance(img_sz, (tuple, list)):
+            img_sz = img_sz[0]
         patch_sz = 16   # ViT-B/16
         self.grid_h = self.grid_w = img_sz // patch_sz   # = 21
 
@@ -750,14 +794,23 @@ class ESCNet(nn.Module):
     def _tokens_to_spatial(self, tokens: torch.Tensor) -> torch.Tensor:
         """
         Convert ViT block output tokens to a spatial feature map.
-        tokens : (seq_len, B, C)  where seq_len = num_patches + 1  (CLS first)
+        Supports both token layouts used by different open_clip versions:
+          LND (legacy): (seq_len, B, C)  — CLS token at position [0]
+          NLD (newer):  (B, seq_len, C)  — CLS token at position [:, 0, :]
         Returns: (B, C, H, W)
         """
-        # Drop CLS token
-        patches = tokens[1:]                                  # (N, B, C)
-        B, C    = patches.shape[1], patches.shape[2]
-        # Reshape to spatial grid
-        return patches.permute(1, 2, 0).view(B, C, self.grid_h, self.grid_w)
+        num_tokens = self.grid_h * self.grid_w + 1   # patches + CLS
+
+        if tokens.shape[0] == num_tokens:
+            # ── LND format: (seq_len, B, C) ──────────────────────────────────
+            patches = tokens[1:]                         # (N_patches, B, C)
+            B, C    = patches.shape[1], patches.shape[2]
+            return patches.permute(1, 2, 0).view(B, C, self.grid_h, self.grid_w)
+        else:
+            # ── NLD format: (B, seq_len, C) ──────────────────────────────────
+            patches = tokens[:, 1:, :]                   # (B, N_patches, C)
+            B, _, C = patches.shape
+            return patches.permute(0, 2, 1).view(B, C, self.grid_h, self.grid_w)
 
     def _extract_clip_feats(self, x: torch.Tensor) -> dict:
         """
@@ -771,10 +824,13 @@ class ESCNet(nn.Module):
         # Level 1 → block 5  (mid-low)
         # Level 2 → block 8  (mid-high)
         # Level 3 → block 11 (deep)
-        l0   = self._tokens_to_spatial(self._hook_cache[0])
-        l1   = self._tokens_to_spatial(self._hook_cache[1])
-        l2   = self._tokens_to_spatial(self._hook_cache[2])
-        high = self._tokens_to_spatial(self._hook_cache[3])
+        # Clamp ViT activations to a safe range before they enter the rest of
+        # the pipeline.  Unclamped fp16 ViT outputs can reach ±thousands after
+        # 15+ epochs and cause NaN in subsequent attention/product ops.
+        l0   = self._tokens_to_spatial(self._hook_cache[0]).clamp(-100, 100)
+        l1   = self._tokens_to_spatial(self._hook_cache[1]).clamp(-100, 100)
+        l2   = self._tokens_to_spatial(self._hook_cache[2]).clamp(-100, 100)
+        high = self._tokens_to_spatial(self._hook_cache[3]).clamp(-100, 100)
         mid  = l1  # block-5 features used for mid-level correlation
 
         return {'high': high, 'mid': mid, 'skips': [l0, l1, l2]}
@@ -797,21 +853,88 @@ class ESCNet(nn.Module):
         proj = flat @ self.vis_proj_w                               # (B*H*W, 512)
         return F.normalize(proj.view(B, H, W, -1).permute(0, 3, 1, 2), dim=1)
 
+    # ─────────────────────────────────────────────────────────────────────────
+    #  Multi-prompt text bank
+    # ─────────────────────────────────────────────────────────────────────────
+    def setup_prompt_bank(self, bank_tokenizer, device,
+                          prompts=None):
+        """
+        Pre-encode a list of text prompts and register them as a non-trainable
+        buffer.  Must be called once after the model is moved to `device`.
+
+        Parameters
+        ----------
+        bank_tokenizer : callable
+            open_clip tokenizer (same one used for captions).
+        device : str or torch.device
+        prompts : list[str] | None
+            Defaults to SKIN_PROMPT_BANK.
+        """
+        if prompts is None:
+            prompts = SKIN_PROMPT_BANK
+        tokens = bank_tokenizer(prompts).to(device)          # (K, L)
+        with torch.no_grad():
+            embeds = self._encode_text(tokens)               # (K, 512)
+        # register_buffer keeps the tensor on the right device when model is
+        # moved, and excludes it from optimizer updates.
+        self.register_buffer('_bank_embeds', embeds)
+        print(f"[INFO] Prompt bank: {len(prompts)} descriptions encoded "
+              f"({embeds.shape[1]}-d CLIP embeddings)")
+
+    def _has_bank(self) -> bool:
+        return hasattr(self, '_bank_embeds') and self._bank_embeds is not None
+
+    # ─────────────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _minmax(t: torch.Tensor) -> torch.Tensor:
+        """Per-sample min-max normalisation over (H, W)."""
+        mn = t.flatten(1).min(1)[0].view(-1, 1, 1)
+        mx = t.flatten(1).max(1)[0].view(-1, 1, 1)
+        return (t - mn) / (mx - mn + 1e-6)
+
     def compute_corr(self, feats: dict, txt_embeds: torch.Tensor) -> torch.Tensor:
         """
         Compute normalised cosine-similarity correlation maps.
+
+        When a prompt bank has been set up via `setup_prompt_bank`, this
+        computes a correlation map for every bank prompt *plus* the per-sample
+        caption, then takes the element-wise maximum over all prompts.
+        The maximum aggregation ensures that even small lesion regions that
+        only respond to one specific prompt are not suppressed.
+
+        Without a bank it falls back to the original single-prompt behaviour.
+
         Returns (B, 2, H, W): [high-level corr, mid-level corr].
         """
-        def minmax(t):
-            mn = t.flatten(1).min(1)[0].view(-1, 1, 1)
-            mx = t.flatten(1).max(1)[0].view(-1, 1, 1)
-            return (t - mn) / (mx - mn + 1e-6)
+        high_proj = self._project_visual(feats['high'])   # (B, 512, H, W)
+        mid_proj  = self._project_visual(feats['mid'])    # (B, 512, H, W)
 
-        high_proj = self._project_visual(feats['high'])             # (B, 512, 21, 21)
-        mid_proj  = self._project_visual(feats['mid'])              # (B, 512, 21, 21)
+        if self._has_bank():
+            # ── Multi-prompt path ─────────────────────────────────────────────
+            # bank:   (K, 512)  — shared for all samples
+            # single: (B, 512)  — per-sample caption embedding
 
-        high_corr = minmax(torch.einsum('bchw,bc->bhw', high_proj, txt_embeds))
-        mid_corr  = minmax(torch.einsum('bchw,bc->bhw', mid_proj,  txt_embeds))
+            # Correlation with every bank prompt:  (B, K, H, W)
+            high_bank = torch.einsum('bchw,kc->bkhw', high_proj, self._bank_embeds)
+            mid_bank  = torch.einsum('bchw,kc->bkhw', mid_proj,  self._bank_embeds)
+
+            # Correlation with per-sample caption:  (B, 1, H, W)
+            high_cap  = torch.einsum('bchw,bc->bhw', high_proj, txt_embeds).unsqueeze(1)
+            mid_cap   = torch.einsum('bchw,bc->bhw', mid_proj,  txt_embeds).unsqueeze(1)
+
+            # Concatenate all K+1 maps and take the max over the prompt axis
+            # so any region activated by ANY prompt is preserved.
+            high_corr = torch.cat([high_bank, high_cap], dim=1).max(dim=1).values  # (B,H,W)
+            mid_corr  = torch.cat([mid_bank,  mid_cap],  dim=1).max(dim=1).values
+
+        else:
+            # ── Single-prompt fallback ────────────────────────────────────────
+            high_corr = torch.einsum('bchw,bc->bhw', high_proj, txt_embeds)  # (B,H,W)
+            mid_corr  = torch.einsum('bchw,bc->bhw', mid_proj,  txt_embeds)
+
+        high_corr = self._minmax(high_corr)
+        mid_corr  = self._minmax(mid_corr)
 
         H, W = feats['high'].shape[-2:]
         return torch.cat([
@@ -925,25 +1048,84 @@ def tta_predict(model, img_t, tokens):
 #  LR SCHEDULER
 # ─────────────────────────────────────────────────────────────────────────────
 class WarmupCosineScheduler(torch.optim.lr_scheduler._LRScheduler):
-    """Linear warmup for `warmup_epochs`, then cosine decay to `eta_min`."""
+    """Linear warmup then segment-wise cosine decay with milestone drops.
+
+    After the warmup phase the LR follows a fresh cosine curve within each
+    segment.  At each milestone the *starting* LR of the new segment is
+    multiplied by ``milestone_decay``, producing a staircase-cosine shape.
+
+    Example  (total=100, milestones=[0.5, 0.75], decay=0.1, warmup=5):
+      segment 0  ep  5-49   cosine  base_lr      → base_lr * 0.1
+      segment 1  ep 50-74   cosine  base_lr*0.1  → base_lr * 0.01
+      segment 2  ep 75-99   cosine  base_lr*0.01 → eta_min
+
+    Args:
+        milestones:      list of *fractions* of total_epochs (e.g. [0.5, 0.75]).
+                         Defaults to [0.5, 0.75].
+        milestone_decay: multiplicative factor applied at each milestone.
+                         Default 0.1 (one decade per milestone).
+    """
     def __init__(self, optimizer, warmup_epochs, total_epochs,
+                 milestones=None, milestone_decay=0.1,
                  eta_min=1e-6, last_epoch=-1):
-        self.warmup_epochs = warmup_epochs
-        self.total_epochs  = total_epochs
-        self.eta_min       = eta_min
+        self.warmup_epochs   = warmup_epochs
+        self.total_epochs    = total_epochs
+        self.milestone_decay = milestone_decay
+        self.eta_min         = eta_min
+
+        if milestones is None:
+            milestones = [0.5, 0.75]
+
+        # Convert fractional milestones → integer epoch breakpoints.
+        # Always include warmup_end and total_epochs; deduplicate & sort.
+        ms_ep = [int(f * total_epochs) for f in milestones]
+        self._breaks = sorted(set(
+            [warmup_epochs]
+            + [m for m in ms_ep if m > warmup_epochs]
+            + [total_epochs]
+        ))
+
         super().__init__(optimizer, last_epoch)
+
+    # ------------------------------------------------------------------
+    def _segment_for(self, ep):
+        """Return (seg_index, seg_start, seg_end) for a given epoch."""
+        breaks = self._breaks
+        for i in range(len(breaks) - 1):
+            if ep < breaks[i + 1]:
+                return i, breaks[i], breaks[i + 1]
+        # ep >= total_epochs: clamp to last segment
+        return len(breaks) - 2, breaks[-2], breaks[-1]
 
     def get_lr(self):
         ep = self.last_epoch
+
+        # ── Warmup ───────────────────────────────────────────────────────────
         if ep < self.warmup_epochs:
             factor = (ep + 1) / max(self.warmup_epochs, 1)
-        else:
-            progress = ((ep - self.warmup_epochs) /
-                        max(self.total_epochs - self.warmup_epochs, 1))
-            factor   = (self.eta_min / self.base_lrs[0] +
-                        0.5 * (1 - self.eta_min / self.base_lrs[0]) *
-                        (1 + math.cos(math.pi * progress)))
-        return [base_lr * factor for base_lr in self.base_lrs]
+            return [base_lr * factor for base_lr in self.base_lrs]
+
+        # ── Segment-wise cosine ───────────────────────────────────────────────
+        num_segs         = len(self._breaks) - 1
+        seg, seg_s, seg_e = self._segment_for(ep)
+        seg_len          = max(seg_e - seg_s, 1)
+        progress         = (ep - seg_s) / seg_len          # 0 → 1 within seg
+
+        d      = self.milestone_decay
+        hi_fac = d ** seg                                   # seg-start multiplier
+        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+
+        lrs = []
+        for base_lr in self.base_lrs:
+            lr_hi = base_lr * hi_fac
+            if seg == num_segs - 1:
+                # Last segment → decay all the way to eta_min
+                lr = self.eta_min + (lr_hi - self.eta_min) * cosine
+            else:
+                lr_lo = base_lr * (d ** (seg + 1))
+                lr = lr_lo + (lr_hi - lr_lo) * cosine
+            lrs.append(max(lr, self.eta_min))
+        return lrs
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  TRAINING LOOP
@@ -954,48 +1136,142 @@ class WarmupCosineScheduler(torch.optim.lr_scheduler._LRScheduler):
 # ─────────────────────────────────────────────────────────────────────────────
 def train_loop(model, dataloader, optimizer, scheduler, device, epochs,
                save_path, pp_loss_weight=0.3, ds_weight=0.3, threshold=0.5):
+    """
+    Training loop with:
+      • Per-batch NaN/Inf loss guard (skips weight update, logs breakdown)
+      • Per-epoch component logging: Tversky, Focal, PP losses
+      • Gradient norm tracking (mean & max per epoch)
+      • AMP scale-drop counter (each drop = GradScaler detected overflow)
+      • CSV diagnostics file for post-hoc analysis
+    """
     criterion  = CompoundLoss(w_tversky=0.6, w_focal=0.4, gamma=2.0,
                               tversky_alpha=0.7, tversky_beta=0.3)
-    scaler     = GradScaler()
+    # init_scale=4096: the default (65536) dropped 4× in epoch 1 every run,
+    # so pre-set it to the stable value.  growth_interval=2000 avoids
+    # re-growing aggressively and triggering new overflows.
+    scaler     = GradScaler('cuda', init_scale=4096.0, growth_interval=2000)
     best_dice  = 0.0
     last_path  = save_path.replace('escnet_best.pth', 'escnet_last.pth')
+    # "clean" checkpoint: only saved when the epoch has ZERO NaN batches.
+    # Used as the recovery target so we never reload a checkpoint that was
+    # itself produced during a corrupted epoch.
+    clean_path = save_path.replace('escnet_best.pth', 'escnet_clean.pth')
+    diag_path  = save_path.replace('escnet_best.pth', 'training_diagnostics.csv')
 
     history = {'loss': [], 'dice': [], 'iou': [], 'lr': []}
 
+    # ── Write CSV header ──────────────────────────────────────────────────────
+    _fields = ['epoch', 'loss', 'loss_tversky', 'loss_focal', 'loss_pp',
+               'dice', 'iou', 'lr',
+               'grad_norm_mean', 'grad_norm_max',
+               'nan_batches', 'amp_scale_drops', 'amp_scale']
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    with open(diag_path, 'w', newline='') as _f:
+        csv.DictWriter(_f, fieldnames=_fields).writeheader()
+    print(f"[INFO] Diagnostics  → {diag_path}")
+
     print(f"\n{'Epoch':>6}  {'Loss':>8}  {'Dice':>8}  {'IoU':>8}  {'LR':>10}"
-          f"  {'Saved':>8}")
-    print("-" * 60)
+          f"  {'GradNorm':>9}  {'NaN/Skip':>8}  {'Saved':>8}")
+    print("-" * 80)
 
     for epoch in range(1, epochs + 1):
-        model.train()   # ← fixed: was `model.train()S` in original
-        total_loss, all_dice, all_iou = 0.0, [], []
+        model.train()
+        total_loss = 0.0
+        all_dice, all_iou = [], []
+        acc_tv, acc_fc, acc_pp = 0.0, 0.0, 0.0
+        grad_norms: list = []
+        nan_batches    = 0
+        amp_scale_drops = 0
+        consecutive_nan = 0          # tracks run of bad batches
 
-        for imgs, caps, masks, _ in dataloader:
+        for batch_idx, (imgs, caps, masks, _) in enumerate(dataloader):
             imgs, masks = imgs.to(device), masks.to(device)
             tokens      = tokenizer(caps).to(device)
 
-            with autocast():
+            with autocast('cuda'):
                 preds_logits, aux = model(imgs, tokens)
+
+                # ── Detect NaN in model output before touching the loss ────────
+                # All-NaN tv/fc/pp means preds_r was already NaN (model issue,
+                # not a loss-function edge case).
+                if not torch.isfinite(preds_logits).all():
+                    nan_batches    += 1
+                    consecutive_nan += 1
+                    n_nan = (~torch.isfinite(preds_logits)).sum().item()
+                    print(f"  [WARN] E{epoch:03d} B{batch_idx:04d}: "
+                          f"NaN/Inf in model output ({n_nan} values) — "
+                          f"skipping batch (streak={consecutive_nan})")
+                    optimizer.zero_grad()
+
+                    # ── Checkpoint recovery ───────────────────────────────────
+                    # 3+ consecutive NaN batches means weights are corrupted.
+                    # Always prefer the "clean" checkpoint (last epoch with 0
+                    # NaN batches) over the "best" checkpoint which may itself
+                    # have been saved during a partially-corrupted epoch.
+                    if consecutive_nan >= 3:
+                        recovery = (clean_path if os.path.exists(clean_path)
+                                    else save_path)
+                        if os.path.exists(recovery):
+                            ckpt_r = torch.load(recovery, map_location=device,
+                                                weights_only=False)
+                            model.load_state_dict(ckpt_r['model_state'])
+                            optimizer.load_state_dict(ckpt_r['optimizer_state'])
+                            tag = 'clean' if recovery == clean_path else 'best'
+                            print(f"  [RECOVER] Reloaded {tag} ckpt "
+                                  f"(epoch {ckpt_r['epoch']}, "
+                                  f"dice={ckpt_r.get('best_dice', ckpt_r.get('avg_dice', 0)):.4f})")
+                        consecutive_nan = 0   # reset streak after reload
+
+                    continue            # ← no scaler.update(); backward never called
+
                 preds_r = F.interpolate(preds_logits, size=masks.shape[-2:],
                                         mode='bilinear', align_corners=False)
-                loss = criterion(preds_r, masks)
+
+                # Main loss — get component scalars at no extra compute cost
+                loss, _stats = criterion.forward_with_stats(preds_r, masks)
 
                 for ds_key in ('ds2', 'ds3'):
                     if aux.get(ds_key) is not None:
                         ds_r = F.interpolate(aux[ds_key], size=masks.shape[-2:],
                                              mode='bilinear', align_corners=False)
-                        loss += ds_weight * criterion(ds_r, masks)
+                        loss = loss + ds_weight * criterion(ds_r, masks)
 
-                loss += pp_loss_weight * _point_cls_loss(preds_r, masks, aux, device)
+                loss_pp = _point_cls_loss(preds_r, masks, aux, device)
+                loss    = loss + pp_loss_weight * loss_pp
 
+            # ── Guard: non-finite scalar loss (loss-function edge case) ────────
+            if not torch.isfinite(loss):
+                nan_batches += 1
+                print(f"  [WARN] E{epoch:03d} B{batch_idx:04d}: "
+                      f"non-finite loss  "
+                      f"tv={_stats['tversky']:.4f}  "
+                      f"fc={_stats['focal']:.4f}  "
+                      f"pp={loss_pp.item():.4f}  — skipping update")
+                optimizer.zero_grad()
+                # scaler.update() must NOT be called here — backward was never
+                # called so the scaler has no inf-checks recorded and would
+                # raise: "No inf checks were recorded prior to update."
+                continue
+
+            # ── Normal backward pass ──────────────────────────────────────────
+            prev_scale = scaler.get_scale()
             optimizer.zero_grad()
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            gn = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
             scaler.step(optimizer)
             scaler.update()
 
+            if scaler.get_scale() < prev_scale:
+                amp_scale_drops += 1   # GradScaler detected overflow → skipped step
+
+            consecutive_nan = 0        # successful update → reset streak
+            grad_norms.append(float(gn))
             total_loss += loss.item()
+            acc_tv     += _stats['tversky']
+            acc_fc     += _stats['focal']
+            acc_pp     += loss_pp.item()
+
             preds_probs = torch.sigmoid(preds_r)
             d, i = batch_dice_iou(preds_probs, masks, threshold)
             all_dice.append(d)
@@ -1003,39 +1279,69 @@ def train_loop(model, dataloader, optimizer, scheduler, device, epochs,
 
         scheduler.step()
 
-        n        = len(dataloader)
-        avg_loss = float(total_loss / n)
-        avg_dice = float(np.mean(all_dice))
-        avg_iou  = float(np.mean(all_iou))
+        n_valid  = max(len(dataloader) - nan_batches, 1)
+        avg_loss = float(total_loss / n_valid)
+        avg_dice = float(np.mean(all_dice) if all_dice else 0.0)
+        avg_iou  = float(np.mean(all_iou)  if all_iou  else 0.0)
+        avg_gn   = float(np.mean(grad_norms) if grad_norms else 0.0)
+        max_gn   = float(max(grad_norms)     if grad_norms else 0.0)
+        avg_tv   = float(acc_tv / n_valid)
+        avg_fc   = float(acc_fc / n_valid)
+        avg_pp   = float(acc_pp / n_valid)
         cur_lr   = float(optimizer.param_groups[0]['lr'])
+        amp_scale = float(scaler.get_scale())
 
         history['loss'].append(avg_loss)
         history['dice'].append(avg_dice)
         history['iou'] .append(avg_iou)
         history['lr']  .append(cur_lr)
 
+        # ── Append diagnostics row ────────────────────────────────────────────
+        row = {'epoch': epoch, 'loss': avg_loss,
+               'loss_tversky': avg_tv, 'loss_focal': avg_fc, 'loss_pp': avg_pp,
+               'dice': avg_dice, 'iou': avg_iou, 'lr': cur_lr,
+               'grad_norm_mean': avg_gn, 'grad_norm_max': max_gn,
+               'nan_batches': nan_batches,
+               'amp_scale_drops': amp_scale_drops, 'amp_scale': amp_scale}
+        with open(diag_path, 'a', newline='') as _f:
+            csv.DictWriter(_f, fieldnames=_fields).writerow(row)
+
         # ── Checkpoint: last epoch (always overwrite) ─────────────────────────
-        os.makedirs(os.path.dirname(save_path), exist_ok=True)
         last_payload = {
             'epoch': epoch, 'model_state': model.state_dict(),
             'optimizer_state': optimizer.state_dict(),
-            'history': history,
+            'avg_dice': avg_dice, 'history': history,
         }
         torch.save(last_payload, last_path)
 
-        # ── Checkpoint: best training Dice ────────────────────────────────────
         saved_tag = "last"
-        if avg_dice > best_dice:
+
+        # ── Checkpoint: "clean" — only when the epoch has ZERO NaN batches ────
+        # This is the recovery target.  Using the "best" checkpoint as recovery
+        # target was the bug: best may have been saved during a 55-NaN epoch,
+        # so reloading it kept the model in a corrupted state.
+        if nan_batches == 0:
+            torch.save(last_payload, clean_path)
+            saved_tag = "clean+last"
+
+        # ── Checkpoint: best training Dice (only when epoch is clean) ─────────
+        # Prevents a high-Dice epoch that also had many NaN batches from
+        # overwriting the best checkpoint with a semi-corrupted state.
+        if avg_dice > best_dice and nan_batches == 0:
             best_dice = avg_dice
             best_payload = {**last_payload, 'best_dice': best_dice}
             torch.save(best_payload, save_path)
-            saved_tag = "best+last"
+            saved_tag = "best+clean+last"
 
+        nan_tag = f"{nan_batches}nan" if nan_batches else f"{amp_scale_drops}ovf"
         print(f"{epoch:>6}  {avg_loss:>8.4f}  {avg_dice:>8.4f}  "
-              f"{avg_iou:>8.4f}  {cur_lr:>10.2e}  {saved_tag:>8}")
+              f"{avg_iou:>8.4f}  {cur_lr:>10.2e}  "
+              f"{avg_gn:>9.3f}  {nan_tag:>8}  {saved_tag:>8}")
 
-    print(f"\n[INFO] Best Train Dice : {best_dice:.4f}  → {save_path}")
-    print(f"[INFO] Last checkpoint : epoch {epochs}    → {last_path}")
+    print(f"\n[INFO] Diagnostics CSV  : {diag_path}")
+    print(f"[INFO] Best Train Dice  : {best_dice:.4f}  → {save_path}")
+    print(f"[INFO] Last checkpoint  : epoch {epochs}    → {last_path}")
+    print(f"[INFO] Last clean ckpt  : → {clean_path}")
     return history
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1097,34 +1403,119 @@ def evaluate_loop(model, images_dir, masks_dir, device,
     return dice_arr, iou_arr
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  TEST LOOP  (save side-by-side visualisations)
 # ─────────────────────────────────────────────────────────────────────────────
-def test_loop(model, images_dir, output_dir, device, threshold=0.5):
+#  TEST LOOP  (save visualisations)
+# ─────────────────────────────────────────────────────────────────────────────
+def _make_overlay(image_np: np.ndarray, mask_bin: np.ndarray,
+                  colour: tuple, alpha: float = 0.45) -> np.ndarray:
+    """
+    Blend a boolean mask over an RGB image and draw a 1-px contour border.
+    colour : (R, G, B) in [0, 255]
+    Returns a uint8 RGB array.
+    """
+    from scipy.ndimage import binary_dilation
+    out = image_np.copy().astype(np.float32)
+    c   = np.array(colour, dtype=np.float32)
+    # Semi-transparent fill
+    out[mask_bin] = out[mask_bin] * (1 - alpha) + c * alpha
+    # Solid 1-px border  (dilated XOR original)
+    border = binary_dilation(mask_bin, iterations=2) & ~mask_bin
+    out[border] = c
+    return out.clip(0, 255).astype(np.uint8)
+
+
+def test_loop(model, images_dir, output_dir, device,
+              masks_dir=None, threshold=0.5):
+    """
+    Save per-image visualisation panels for all images in `images_dir`.
+
+    Layout when GT masks are available (masks_dir is set):
+      ┌──────────────┬──────────────────┬──────────────────────────────┐
+      │ Input image  │  GT overlay (⬜) │  Prediction overlay (🟥)     │
+      │              │  (green)         │  Dice=X.XXX  IoU=X.XXX       │
+      └──────────────┴──────────────────┴──────────────────────────────┘
+
+    Layout without GT (masks_dir=None or mask not found):
+      ┌──────────────┬──────────────────────┐
+      │ Input image  │  Prediction overlay  │
+      └──────────────┴──────────────────────┘
+
+    Overlays: green fill+border = GT, red fill+border = Prediction.
+    Per-image Dice / IoU are shown in the prediction panel title.
+    Files are saved as <output_dir>/<stem>.png at 150 dpi.
+    """
     os.makedirs(output_dir, exist_ok=True)
     model.eval()
     image_files = sorted([f for f in os.listdir(images_dir)
-                           if f.lower().endswith(IMAGE_EXTENSIONS)])
-    print(f"\n[INFO] Generating test outputs → {output_dir}")
+                          if f.lower().endswith(IMAGE_EXTENSIONS)])
+    print(f"\n[INFO] Generating test visualisations → {output_dir}")
 
+    saved = 0
     for fn in image_files:
         image    = Image.open(os.path.join(images_dir, fn)).convert('RGB')
-        image_np = np.array(image)
+        image_np = np.array(image)                                # H×W×3
         img_t    = val_aug(image=image_np)['image'].float().unsqueeze(0).to(device)
         tokens   = tokenizer([CAPTION]).to(device)
 
+        # ── Prediction ────────────────────────────────────────────────────────
         pred_probs = tta_predict(model, img_t, tokens)
-        pred_np    = F.interpolate(pred_probs, size=(image.height, image.width),
-                                    mode='bilinear', align_corners=False
-                                    )[0, 0].cpu().numpy()
-        mask_u8    = (postprocess_mask(pred_np, threshold).astype(np.uint8) * 255)
-        mask_rgb   = Image.fromarray(mask_u8).convert('RGB')
+        pred_np    = F.interpolate(pred_probs,
+                                   size=(image.height, image.width),
+                                   mode='bilinear', align_corners=False
+                                   )[0, 0].cpu().numpy()
+        pred_bin   = postprocess_mask(pred_np, threshold)         # bool H×W
 
-        canvas = Image.new('RGB', (image.width * 2, image.height))
-        canvas.paste(image,    (0, 0))
-        canvas.paste(mask_rgb, (image.width, 0))
-        canvas.save(os.path.join(output_dir, fn))
+        # ── GT (optional) ─────────────────────────────────────────────────────
+        gt_bin = None
+        if masks_dir is not None:
+            gt_path = find_mask_path(masks_dir, fn)
+            if gt_path is not None:
+                gt_np  = np.array(Image.open(gt_path).convert('L'),
+                                  dtype=np.float32) / 255.0
+                gt_bin = gt_np > 0.5
 
-    print(f"[INFO] Saved {len(image_files)} output images")
+        # ── Figure layout ─────────────────────────────────────────────────────
+        n_cols = 3 if gt_bin is not None else 2
+        fig, axes = plt.subplots(1, n_cols,
+                                 figsize=(5.5 * n_cols, 5.5),
+                                 gridspec_kw={'wspace': 0.04})
+        fig.patch.set_facecolor('#1a1a1a')
+
+        # Panel 1 — original image
+        axes[0].imshow(image_np)
+        axes[0].set_title('Input', color='white', fontsize=11, pad=5)
+        axes[0].axis('off')
+
+        col = 1
+
+        # Panel 2 — GT overlay (green)
+        if gt_bin is not None:
+            axes[col].imshow(_make_overlay(image_np, gt_bin, (50, 220, 50)))
+            axes[col].set_title('Ground Truth', color='#32de84',
+                                fontsize=11, pad=5)
+            axes[col].axis('off')
+            col += 1
+
+        # Panel 3 — Prediction overlay (red) + per-image metrics
+        pred_title = 'Prediction'
+        if gt_bin is not None:
+            d = dice_score(pred_bin, gt_bin)
+            j = iou_score(pred_bin, gt_bin)
+            pred_title = f'Prediction    Dice {d:.3f}  ·  IoU {j:.3f}'
+
+        axes[col].imshow(_make_overlay(image_np, pred_bin, (220, 60, 60)))
+        axes[col].set_title(pred_title, color='#ff6b6b', fontsize=11, pad=5)
+        axes[col].axis('off')
+
+        # ── Save ──────────────────────────────────────────────────────────────
+        stem     = os.path.splitext(fn)[0]
+        out_path = os.path.join(output_dir, stem + '.png')
+        plt.savefig(out_path, dpi=150, bbox_inches='tight',
+                    facecolor=fig.get_facecolor())
+        plt.close(fig)
+        saved += 1
+
+    print(f"[INFO] Saved {saved} visualisation panels → {output_dir}")
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  TRAINING CURVES PLOT
@@ -1313,8 +1704,19 @@ def parse_args():
     # Misc
     p.add_argument('--resume',       default=None,
                    help="Path to checkpoint to resume from")
-    p.add_argument('--no-tta',       action='store_true',
+    p.add_argument('--no-tta',         action='store_true',
                    help="Disable test-time augmentation during evaluation")
+    p.add_argument('--no-prompt-bank', action='store_true',
+                   help="Disable multi-prompt bank (use single caption only)")
+    # LR milestones
+    p.add_argument('--milestones', nargs='+', type=float, default=[0.5, 0.75],
+                   metavar='F',
+                   help="Fractional-epoch milestones for LR reduction "
+                        "(e.g. --milestones 0.5 0.75).  "
+                        "Each value is a fraction of --epochs.")
+    p.add_argument('--milestone-decay', type=float, default=0.1,
+                   help="Multiplicative LR factor applied at each milestone "
+                        "(default 0.1 = one decade per drop)")
     return p.parse_args()
 
 
@@ -1330,7 +1732,8 @@ def main():
         model_name='ViT-B-16',
         pretrained='openai',
         device=device,
-        image_size=args.clip_size)   # 336 × 336
+        force_image_size=args.clip_size,   # 336 × 336
+        force_quick_gelu=True)             # match OpenAI pretrained activation
 
     global tokenizer
     tokenizer = open_clip.get_tokenizer('ViT-B-16')
@@ -1361,6 +1764,13 @@ def main():
                    num_blocks=args.num_blocks,
                    num_prompts=args.num_prompts).to(device)
 
+    # ── Multi-prompt bank  ────────────────────────────────────────────────────
+    # Pre-encode all prompts in the bank and attach them as a non-trainable
+    # buffer.  compute_corr() automatically uses them to build richer
+    # correlation maps via max-pooling over all K+1 text embeddings.
+    if not args.no_prompt_bank:
+        model.setup_prompt_bank(tokenizer, device)
+
     total = sum(p.numel() for p in model.parameters())
     print(f"[INFO] Model parameters: {total / 1e6:.1f} M")
 
@@ -1375,6 +1785,8 @@ def main():
         optimizer,
         warmup_epochs=args.warmup_ep,
         total_epochs=args.epochs,
+        milestones=args.milestones,
+        milestone_decay=args.milestone_decay,
         eta_min=1e-6)
 
     # ── Resume from checkpoint  ───────────────────────────────────────────────
@@ -1425,10 +1837,10 @@ def main():
             use_postprocess=True, use_tta=use_tta)
         test_results = {'dice': test_dice, 'iou': test_iou}
 
-        # Also save side-by-side visualisation images
+        # Also save side-by-side visualisation images (with GT panels)
         test_loop(model, args.test_img,
                   os.path.join(args.output_dir, 'test_outputs'),
-                  device, threshold=args.threshold)
+                  device, masks_dir=args.test_mask, threshold=args.threshold)
     elif has_test_imgs:
         print(f"\n[INFO] Test GT not found at {args.test_mask} — "
               "generating visual outputs only (no metrics)")
