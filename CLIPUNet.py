@@ -247,15 +247,22 @@ class CLIPEncoder(nn.Module):
 #  UNET DECODER  (resolution-agnostic)
 # ─────────────────────────────────────────────────────────────────────────────
 class ConvBlock(nn.Module):
-    """Conv→BN→ReLU ×2"""
-    def __init__(self, in_c, out_c):
+    """Conv→BN→ReLU ×2, with optional spatial dropout before output.
+
+    Dropout2d (channel-wise) regularises better than plain Dropout for
+    conv feature maps; p>0 only on deep/wide stages — never near the head.
+    """
+    def __init__(self, in_c, out_c, p_drop=0.0):
         super().__init__()
-        self.net = nn.Sequential(
+        layers = [
             nn.Conv2d(in_c,  out_c, 3, padding=1, bias=False),
             nn.BatchNorm2d(out_c), nn.ReLU(inplace=True),
             nn.Conv2d(out_c, out_c, 3, padding=1, bias=False),
             nn.BatchNorm2d(out_c), nn.ReLU(inplace=True),
-        )
+        ]
+        if p_drop > 0:
+            layers.append(nn.Dropout2d(p_drop))
+        self.net = nn.Sequential(*layers)
     def forward(self, x):
         return self.net(x)
 
@@ -276,8 +283,11 @@ class CLIPUNetDecoder(nn.Module):
     Stage sizes are derived from the feature grid and input size at runtime,
     so any --clip-size works (student hardcoded 14/28/56/112/224).
     """
-    def __init__(self, clip_ch=768):
+    def __init__(self, clip_ch=768, dropout=0.2):
         super().__init__()
+        # Dropout schedule: heaviest at the wide bottleneck, tapering to 0 at
+        # the head so fine boundary detail is not randomly zeroed near output.
+        d0, d1, d2, d3 = dropout, dropout * 0.75, dropout * 0.5, 0.0
         self.proj_deep = nn.Sequential(   # deepest tap → bottleneck
             nn.Conv2d(clip_ch, 512, 1, bias=False),
             nn.BatchNorm2d(512), nn.ReLU(inplace=True))
@@ -299,10 +309,10 @@ class CLIPUNetDecoder(nn.Module):
             nn.BatchNorm2d(32), nn.ReLU(inplace=True),
         )
 
-        self.stage0 = ConvBlock(512,            256)
-        self.stage1 = ConvBlock(256 + 256,      128)
-        self.stage2 = ConvBlock(128 + 128,       64)
-        self.stage3 = ConvBlock(64  +  64 + 32,  32)
+        self.stage0 = ConvBlock(512,            256, p_drop=d0)
+        self.stage1 = ConvBlock(256 + 256,      128, p_drop=d1)
+        self.stage2 = ConvBlock(128 + 128,       64, p_drop=d2)
+        self.stage3 = ConvBlock(64  +  64 + 32,  32, p_drop=d3)
         self.head   = nn.Conv2d(32, 1, 1)
 
     @staticmethod
@@ -340,10 +350,11 @@ class CLIPUNetDecoder(nn.Module):
 #  FULL MODEL
 # ─────────────────────────────────────────────────────────────────────────────
 class CLIPUNet(nn.Module):
-    def __init__(self, clip_visual, clip_size):
+    def __init__(self, clip_visual, clip_size, dropout=0.2):
         super().__init__()
         self.encoder = CLIPEncoder(clip_visual, clip_size)
-        self.decoder = CLIPUNetDecoder(clip_ch=CLIPEncoder.FEAT_DIM)
+        self.decoder = CLIPUNetDecoder(clip_ch=CLIPEncoder.FEAT_DIM,
+                                       dropout=dropout)
 
     def forward(self, x):
         maps = self.encoder(x)
@@ -550,9 +561,17 @@ def parse_args():
     p.add_argument('--clip-size',   type=int,   default=CLIP_SIZE)
     p.add_argument('--lr-clip',     type=float, default=1e-5,
                    help="LR for the fine-tuned CLIP blocks")
-    p.add_argument('--lr-dec',      type=float, default=3e-4,
-                   help="LR for the UNet decoder")
-    p.add_argument('--weight-decay',type=float, default=1e-5)
+    p.add_argument('--lr-dec',      type=float, default=2e-4,
+                   help="LR for the UNet decoder (lowered from 3e-4 to curb "
+                        "fast memorisation of the 2k-image train set)")
+    p.add_argument('--weight-decay',type=float, default=1e-2,
+                   help="AdamW weight decay on conv/linear weights only "
+                        "(norms & biases are excluded). Raised from 1e-5.")
+    p.add_argument('--dropout',     type=float, default=0.2,
+                   help="Decoder Dropout2d rate at the bottleneck; tapers to "
+                        "0 toward the head. Set 0 to disable.")
+    p.add_argument('--lr-min',      type=float, default=1e-6,
+                   help="Cosine schedule floor (eta_min)")
     p.add_argument('--threshold',   type=float, default=0.5)
     p.add_argument('--resume',      default=None)
     p.add_argument('--test-only',   action='store_true',
@@ -579,7 +598,8 @@ def main():
         force_image_size=args.clip_size,
         force_quick_gelu=True)
 
-    model = CLIPUNet(clip_model.visual, args.clip_size).to(device)
+    model = CLIPUNet(clip_model.visual, args.clip_size,
+                     dropout=args.dropout).to(device)
 
     # Shape sanity check
     with torch.no_grad():
@@ -621,14 +641,28 @@ def main():
                           num_workers=args.num_workers, pin_memory=True,
                           drop_last=True)
 
-    # ── Optimiser: two LR groups (CLIP vs decoder) ────────────────────────────
-    clip_params = [p for p in model.encoder.parameters() if p.requires_grad]
-    dec_params  = list(model.decoder.parameters())
+    # ── Optimiser: two LR groups (CLIP vs decoder) × decay/no-decay ───────────
+    # Weight decay is applied ONLY to conv/linear weights. BatchNorm scales,
+    # biases, and all 1-D params are excluded — decaying them shrinks the
+    # effective normalisation/offset and hurts more than it helps.
+    def split_decay(module):
+        decay, no_decay = [], []
+        for _, p in module.named_parameters():
+            if not p.requires_grad:
+                continue
+            (no_decay if p.ndim <= 1 else decay).append(p)
+        return decay, no_decay
+
+    clip_d, clip_nd = split_decay(model.encoder)
+    dec_d,  dec_nd  = split_decay(model.decoder)
     optimizer = torch.optim.AdamW([
-        {'params': clip_params, 'lr': args.lr_clip},
-        {'params': dec_params,  'lr': args.lr_dec},
-    ], weight_decay=args.weight_decay)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
+        {'params': clip_d,  'lr': args.lr_clip, 'weight_decay': args.weight_decay},
+        {'params': clip_nd, 'lr': args.lr_clip, 'weight_decay': 0.0},
+        {'params': dec_d,   'lr': args.lr_dec,  'weight_decay': args.weight_decay},
+        {'params': dec_nd,  'lr': args.lr_dec,  'weight_decay': 0.0},
+    ])
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=args.epochs, eta_min=args.lr_min)
 
     start_epoch, best_dice = 0, 0.0
     if args.resume and os.path.exists(args.resume):
@@ -641,7 +675,10 @@ def main():
 
     print("=" * 65)
     print("  Encoder : CLIP ViT-B/16  blocks 2,5,8,11  (lr=%.0e)" % args.lr_clip)
-    print("  Decoder : UNet 4-stage + high-res image skip  (lr=%.0e)" % args.lr_dec)
+    print("  Decoder : UNet 4-stage + high-res image skip  (lr=%.0e, drop=%.2f)"
+          % (args.lr_dec, args.dropout))
+    print("  Reg     : weight_decay=%.0e (weights only)  cosine→%.0e"
+          % (args.weight_decay, args.lr_min))
     print("  Loss    : 0.4·BCE + 0.4·Dice + 0.2·Boundary")
     print("  Val     : dedicated ISIC validation split (no augmentation)")
     print("=" * 65)
