@@ -70,7 +70,7 @@ TEST_MASK_PATH         = os.path.join(DATASET, 'ISIC-2017_Test_v2_Part1_GroundTr
 OUTPUT_DIR             = os.path.join(BASE_DIR, 'outputs_clipunet')
 
 IMAGE_EXTENSIONS = ('.jpg', '.jpeg', '.png', '.bmp', '.tif', '.tiff')
-CLIP_SIZE = 224                       # ViT-B/16 @ 224 → 14×14 patch grid
+CLIP_SIZE = 336                       # ViT-B/16 @ 336 → 21×21 patch grid
 CLIP_MEAN = (0.48145466, 0.4578275,  0.40821073)
 CLIP_STD  = (0.26862954, 0.26130258, 0.27577711)
 
@@ -179,7 +179,7 @@ class CLIPEncoder(nn.Module):
     consistent (the student's version tapped and trained different layers).
 
     HOOK_INDICES span the depth: shallow → early-mid → mid-deep → deep.
-    Every tap is at the ViT patch resolution (grid×grid, e.g. 14×14 @ 224).
+    Every tap is at the ViT patch resolution (grid×grid, e.g. 21×21 @ 336).
     """
     HOOK_INDICES = [2, 5, 8, 11]   # 0-based block indices (out of 12)
     FEAT_DIM     = 768             # ViT-B hidden dimension
@@ -187,7 +187,7 @@ class CLIPEncoder(nn.Module):
     def __init__(self, clip_visual, clip_size):
         super().__init__()
         self.clip_visual = clip_visual
-        self.grid        = clip_size // 16          # ViT-B/16 patch grid
+        self.grid        = clip_size // 16          # 21 for 336×336 inputs
         self._cache: dict = {}
 
         # Register hooks
@@ -325,8 +325,8 @@ class CLIPUNetDecoder(nn.Module):
         maps    : [shallow, early-mid, mid-deep, deep], each (B, 768, g, g)
         raw_img : normalised input (B, 3, S, S)
         """
-        g  = maps[0].shape[-1]            # patch grid (e.g. 14)
-        S  = raw_img.shape[-1]            # input resolution (e.g. 224)
+        g  = maps[0].shape[-1]            # patch grid (e.g. 21 @ 336)
+        S  = raw_img.shape[-1]            # input resolution (e.g. 336)
         s1, s2, s3 = g * 2, g * 4, g * 8  # per-stage spatial sizes
 
         f_deep = self.proj_deep(maps[3])  # bottleneck
@@ -658,7 +658,8 @@ def parse_args():
     p.add_argument('--epochs',      type=int,   default=40)
     p.add_argument('--batch-size',  type=int,   default=8)
     p.add_argument('--num-workers', type=int,   default=4)
-    p.add_argument('--clip-size',   type=int,   default=CLIP_SIZE)
+    p.add_argument('--clip-size',   type=int,   default=CLIP_SIZE,
+                   help="Input resolution for CLIP ViT-B/16. Default 336 gives a 21×21 patch grid for higher-resolution features; use 224 for lower memory.")
     p.add_argument('--lr-clip',     type=float, default=1e-5,
                    help="LR for the fine-tuned CLIP blocks")
     p.add_argument('--lr-dec',      type=float, default=2e-4,
