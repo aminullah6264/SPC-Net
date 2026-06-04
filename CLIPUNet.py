@@ -37,6 +37,7 @@ Bugs fixed relative to the student's version
 """
 
 import os
+import csv
 import argparse
 import numpy as np
 import torch
@@ -439,6 +440,9 @@ def batch_dice_iou(preds_probs, masks, threshold=0.5):
 def train_one_epoch(model, loader, criterion, optimizer, scaler, device):
     model.train()
     tot_loss, all_d, all_j = 0.0, [], []
+    grad_norms, skipped_batches = [], 0
+    amp_scale_start = scaler.get_scale() if scaler else None
+
     for imgs, masks, _ in loader:
         imgs, masks = imgs.to(device), masks.to(device)
         optimizer.zero_grad()
@@ -447,26 +451,37 @@ def train_one_epoch(model, loader, criterion, optimizer, scaler, device):
             loss   = criterion(logits, masks)
 
         if not torch.isfinite(loss):
+            skipped_batches += 1
             print("  [WARN] non-finite loss — batch skipped")
             continue
 
         if scaler:
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             scaler.step(optimizer)
             scaler.update()
         else:
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
 
+        grad_norms.append(float(grad_norm.detach().cpu())
+                          if torch.is_tensor(grad_norm) else float(grad_norm))
         tot_loss += loss.item()
         d, j = batch_dice_iou(torch.sigmoid(logits), masks)
         all_d.append(d); all_j.append(j)
 
-    return tot_loss / max(len(loader), 1), float(np.mean(all_d or [0])), \
-           float(np.mean(all_j or [0]))
+    valid_batches = max(len(loader) - skipped_batches, 1)
+    diagnostics = {
+        'skipped_batches': skipped_batches,
+        'grad_norm_mean': float(np.mean(grad_norms or [0])),
+        'grad_norm_max': float(np.max(grad_norms or [0])),
+        'amp_scale_start': amp_scale_start,
+        'amp_scale_end': scaler.get_scale() if scaler else None,
+    }
+    return tot_loss / valid_batches, float(np.mean(all_d or [0])), \
+           float(np.mean(all_j or [0])), diagnostics
 
 
 @torch.no_grad()
@@ -542,6 +557,91 @@ def save_visualisations(model, images_dir, masks_dir, device, size, out_dir,
                     dpi=120, bbox_inches='tight')
         plt.close(fig)
     print(f"[INFO] Saved {len(files)} visualisations → {out_dir}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  TRAINING CURVES / RESULTS LOGGING  (mirrors clipsam.py outputs)
+# ─────────────────────────────────────────────────────────────────────────────
+def save_training_plots(history: dict, output_dir: str):
+    """Save CLIPUNet training/validation curves to training_curves.png."""
+    if not history.get('loss'):
+        print("[INFO] No training history available — skipping training_curves.png")
+        return
+
+    epochs = list(range(1, len(history['loss']) + 1))
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+    fig.suptitle('CLIPUNet Training Curves (ISIC-2017)',
+                 fontsize=13, fontweight='bold')
+
+    panels = [
+        ('loss', None, 'Loss', 'tab:red'),
+        ('train_dice', 'val_dice', 'Dice Coefficient', 'tab:blue'),
+        ('train_iou', 'val_iou', 'IoU (Jaccard)', 'tab:green'),
+    ]
+    for ax, (train_key, val_key, title, color) in zip(axes, panels):
+        ax.plot(epochs, history[train_key], color=color, linewidth=1.8,
+                label='train' if val_key else title)
+        ax.fill_between(epochs, history[train_key], alpha=0.12, color=color)
+        if val_key and history.get(val_key):
+            ax.plot(epochs, history[val_key], color='tab:orange', linewidth=1.8,
+                    linestyle='--', label='validation')
+        ax.set_title(title)
+        ax.set_xlabel('Epoch')
+        ax.set_ylabel(title)
+        ax.grid(True, linestyle='--', alpha=0.5)
+        ax.legend(loc='best')
+
+    plt.tight_layout()
+    out_path = os.path.join(output_dir, 'training_curves.png')
+    plt.savefig(out_path, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+    print(f"[INFO] Training curves saved → {out_path}")
+
+
+def save_results_yaml(history: dict, best_dice: float, val_results: dict,
+                      test_results: dict, args, output_dir: str,
+                      best_epoch=None):
+    """Write a structured results.yaml compatible with CLIPSAM-style analysis."""
+    doc = {
+        'model': 'CLIPUNet',
+        'checkpoint': {
+            'best_epoch': best_epoch,
+            'best_val_dice': round(float(best_dice), 6),
+        },
+        'config': {
+            'epochs': args.epochs,
+            'batch_size': args.batch_size,
+            'clip_size': args.clip_size,
+            'lr_clip': args.lr_clip,
+            'lr_decoder': args.lr_dec,
+            'lr_min': args.lr_min,
+            'weight_decay': args.weight_decay,
+            'dropout': args.dropout,
+            'threshold': args.threshold,
+            'train_with_val_data': args.train_with_val_data,
+            'img_path': args.img_path,
+            'mask_path': args.mask_path,
+            'val_img': args.val_img,
+            'val_mask': args.val_mask,
+            'test_img': args.test_img,
+            'test_mask': args.test_mask,
+        },
+        'history': {
+            'epoch_loss': [round(float(v), 6) for v in history.get('loss', [])],
+            'epoch_train_dice': [round(float(v), 6) for v in history.get('train_dice', [])],
+            'epoch_train_iou': [round(float(v), 6) for v in history.get('train_iou', [])],
+            'epoch_val_dice': [round(float(v), 6) for v in history.get('val_dice', [])],
+            'epoch_val_iou': [round(float(v), 6) for v in history.get('val_iou', [])],
+            'lr_clip': [round(float(v), 10) for v in history.get('lr_clip', [])],
+            'lr_decoder': [round(float(v), 10) for v in history.get('lr_decoder', [])],
+        },
+        'validation': val_results,
+        'test': test_results,
+    }
+    out_path = os.path.join(output_dir, 'results.yaml')
+    with open(out_path, 'w') as f:
+        yaml.dump(doc, f, default_flow_style=False, sort_keys=False)
+    print(f"[INFO] Results YAML saved → {out_path}")
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  ARGS
@@ -626,15 +726,27 @@ def main():
         state = torch.load(ckpt, map_location=device)
         model.load_state_dict(state['model'] if 'model' in state else state)
         print(f"[INFO] Loaded {ckpt}")
-        evaluate_loop(model, args.val_img, args.val_mask, device,
-                      args.clip_size, args.threshold, "Validation")
+        val_d, val_j = evaluate_loop(model, args.val_img, args.val_mask, device,
+                                     args.clip_size, args.threshold, "Validation")
+        val_results = {'mean_dice': round(float(val_d.mean()), 6),
+                       'std_dice': round(float(val_d.std()), 6),
+                       'mean_iou': round(float(val_j.mean()), 6),
+                       'std_iou': round(float(val_j.std()), 6)}
+        test_results = None
         if os.path.isdir(args.test_img):
-            evaluate_loop(model, args.test_img, args.test_mask, device,
-                          args.clip_size, args.threshold, "Test")
+            td, tj = evaluate_loop(model, args.test_img, args.test_mask, device,
+                                   args.clip_size, args.threshold, "Test")
+            test_results = {'mean_dice': round(float(td.mean()), 6),
+                            'std_dice': round(float(td.std()), 6),
+                            'mean_iou': round(float(tj.mean()), 6),
+                            'std_iou': round(float(tj.std()), 6)}
             save_visualisations(model, args.test_img, args.test_mask, device,
                                 args.clip_size,
                                 os.path.join(args.output_dir, 'test_outputs'),
                                 args.threshold)
+        save_results_yaml(state.get('history', {}), state.get('best_dice', 0.0),
+                          val_results, test_results, args, args.output_dir,
+                          best_epoch=state.get('epoch'))
         return
 
     # ── Data ──────────────────────────────────────────────────────────────────
@@ -695,43 +807,112 @@ def main():
         print("  Val     : dedicated ISIC validation split (no augmentation)")
     print("=" * 65)
 
+    history = {
+        'loss': [], 'train_dice': [], 'train_iou': [],
+        'val_dice': [], 'val_iou': [], 'lr_clip': [], 'lr_decoder': [],
+    }
+    best_epoch = None
+    diag_path = os.path.join(args.output_dir, 'training_diagnostics.csv')
+    diag_fields = [
+        'epoch', 'loss', 'train_dice', 'train_iou', 'val_dice', 'val_iou',
+        'lr_clip', 'lr_decoder', 'grad_norm_mean', 'grad_norm_max',
+        'skipped_batches', 'amp_scale_start', 'amp_scale_end', 'best_val_dice',
+    ]
+    with open(diag_path, 'w', newline='') as f:
+        csv.DictWriter(f, fieldnames=diag_fields).writeheader()
+    print(f"[INFO] Diagnostics  → {diag_path}")
+
     for epoch in range(start_epoch, args.epochs):
-        tr_loss, tr_d, tr_j = train_one_epoch(
+        tr_loss, tr_d, tr_j, train_diag = train_one_epoch(
             model, train_dl, criterion, optimizer, scaler, device)
         scheduler.step()
-        print(f"Epoch [{epoch+1:02d}/{args.epochs}]  loss={tr_loss:.4f}  "
-              f"train Dice={tr_d:.4f}  IoU={tr_j:.4f}")
 
-        val_d, _ = evaluate_loop(model, args.val_img, args.val_mask, device,
-                                 args.clip_size, args.threshold, "Validation")
+        val_d, val_j = evaluate_loop(model, args.val_img, args.val_mask, device,
+                                     args.clip_size, args.threshold, "Validation")
         mean_val = float(val_d.mean())
+        mean_val_iou = float(val_j.mean())
+        lr_clip = optimizer.param_groups[0]['lr']
+        lr_dec = optimizer.param_groups[2]['lr']
+
+        history['loss'].append(tr_loss)
+        history['train_dice'].append(tr_d)
+        history['train_iou'].append(tr_j)
+        history['val_dice'].append(mean_val)
+        history['val_iou'].append(mean_val_iou)
+        history['lr_clip'].append(lr_clip)
+        history['lr_decoder'].append(lr_dec)
+
+        print(f"Epoch [{epoch+1:02d}/{args.epochs}]  loss={tr_loss:.4f}  "
+              f"train Dice={tr_d:.4f}  IoU={tr_j:.4f}  "
+              f"val Dice={mean_val:.4f}  IoU={mean_val_iou:.4f}")
+
+        if mean_val > best_dice:
+            best_dice = mean_val
+            best_epoch = epoch
+            torch.save({'epoch': epoch, 'model': model.state_dict(),
+                        'optimizer': optimizer.state_dict(),
+                        'best_dice': best_dice, 'history': history}, best_path)
+            print(f"  ✅ Best saved  (Val Dice={best_dice:.4f})")
 
         torch.save({'epoch': epoch, 'model': model.state_dict(),
                     'optimizer': optimizer.state_dict(),
-                    'best_dice': best_dice}, last_path)
-        if mean_val > best_dice:
-            best_dice = mean_val
-            torch.save({'epoch': epoch, 'model': model.state_dict(),
-                        'optimizer': optimizer.state_dict(),
-                        'best_dice': best_dice}, best_path)
-            print(f"  ✅ Best saved  (Val Dice={best_dice:.4f})")
+                    'best_dice': best_dice, 'history': history}, last_path)
+
+        row = {
+            'epoch': epoch + 1,
+            'loss': round(float(tr_loss), 6),
+            'train_dice': round(float(tr_d), 6),
+            'train_iou': round(float(tr_j), 6),
+            'val_dice': round(float(mean_val), 6),
+            'val_iou': round(float(mean_val_iou), 6),
+            'lr_clip': lr_clip,
+            'lr_decoder': lr_dec,
+            'grad_norm_mean': round(float(train_diag['grad_norm_mean']), 6),
+            'grad_norm_max': round(float(train_diag['grad_norm_max']), 6),
+            'skipped_batches': train_diag['skipped_batches'],
+            'amp_scale_start': train_diag['amp_scale_start'],
+            'amp_scale_end': train_diag['amp_scale_end'],
+            'best_val_dice': round(float(best_dice), 6),
+        }
+        with open(diag_path, 'a', newline='') as f:
+            csv.DictWriter(f, fieldnames=diag_fields).writerow(row)
+
+    save_training_plots(history, args.output_dir)
 
     # ── Final test evaluation with the best checkpoint ────────────────────────
-    print("\n[INFO] Loading best checkpoint for test evaluation …")
-    model.load_state_dict(torch.load(best_path, map_location=device)['model'])
-    results = {'best_val_dice': round(best_dice, 6)}
+    print("\n[INFO] Loading best checkpoint for final evaluation …")
+    best_state = torch.load(best_path, map_location=device)
+    model.load_state_dict(best_state['model'])
+    best_epoch = best_state.get('epoch', best_epoch)
+
+    val_d, val_j = evaluate_loop(model, args.val_img, args.val_mask, device,
+                                 args.clip_size, args.threshold, "Validation")
+    val_results = {'mean_dice': round(float(val_d.mean()), 6),
+                   'std_dice': round(float(val_d.std()), 6),
+                   'mean_iou': round(float(val_j.mean()), 6),
+                   'std_iou': round(float(val_j.std()), 6)}
+
+    test_results = None
     if os.path.isdir(args.test_img):
         td, tj = evaluate_loop(model, args.test_img, args.test_mask, device,
                                args.clip_size, args.threshold, "Test")
-        results['test'] = {'mean_dice': round(float(td.mean()), 6),
-                           'mean_iou':  round(float(tj.mean()), 6)}
+        test_results = {'mean_dice': round(float(td.mean()), 6),
+                        'std_dice': round(float(td.std()), 6),
+                        'mean_iou': round(float(tj.mean()), 6),
+                        'std_iou': round(float(tj.std()), 6)}
         save_visualisations(model, args.test_img, args.test_mask, device,
                             args.clip_size,
                             os.path.join(args.output_dir, 'test_outputs'),
                             args.threshold)
-    with open(os.path.join(args.output_dir, 'results.yaml'), 'w') as f:
-        yaml.dump(results, f, default_flow_style=False, sort_keys=False)
+
+    save_results_yaml(history, best_dice, val_results, test_results,
+                      args, args.output_dir, best_epoch=best_epoch)
     print(f"[DONE] Outputs → {args.output_dir}")
+    print("  clipunet_best.pth      — best validation-Dice checkpoint")
+    print("  clipunet_last.pth      — last epoch checkpoint")
+    print("  training_curves.png    — loss / Dice / IoU plots")
+    print("  training_diagnostics.csv")
+    print("  results.yaml           — config, history, val/test metrics")
 
 
 if __name__ == '__main__':
