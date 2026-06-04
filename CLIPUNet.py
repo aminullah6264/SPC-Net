@@ -43,7 +43,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from PIL import Image
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, ConcatDataset
 import open_clip
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
@@ -573,6 +573,8 @@ def parse_args():
     p.add_argument('--lr-min',      type=float, default=1e-6,
                    help="Cosine schedule floor (eta_min)")
     p.add_argument('--threshold',   type=float, default=0.5)
+    p.add_argument('--train-with-val-data', action='store_true',
+                   help="Research-only: append the dedicated validation split to the training loader. Validation is still evaluated after training, so reported validation metrics are no longer held-out.")
     p.add_argument('--resume',      default=None)
     p.add_argument('--test-only',   action='store_true',
                    help="Skip training; load checkpoint and evaluate only")
@@ -637,6 +639,13 @@ def main():
 
     # ── Data ──────────────────────────────────────────────────────────────────
     train_ds = SkinDataset(args.img_path, args.mask_path, args.clip_size, augment=True)
+    if args.train_with_val_data:
+        val_train_ds = SkinDataset(args.val_img, args.val_mask, args.clip_size,
+                                   augment=True)
+        train_ds = ConcatDataset([train_ds, val_train_ds])
+        print("[WARN] Research mode enabled: validation split appended to "
+              "training data. Validation metrics are no longer held-out.")
+        print(f"[INFO] Combined train samples: {len(train_ds)}")
     train_dl = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
                           num_workers=args.num_workers, pin_memory=True,
                           drop_last=True)
@@ -680,7 +689,10 @@ def main():
     print("  Reg     : weight_decay=%.0e (weights only)  cosine→%.0e"
           % (args.weight_decay, args.lr_min))
     print("  Loss    : 0.4·BCE + 0.4·Dice + 0.2·Boundary")
-    print("  Val     : dedicated ISIC validation split (no augmentation)")
+    if args.train_with_val_data:
+        print("  Val     : reused in training (research-only; not held out)")
+    else:
+        print("  Val     : dedicated ISIC validation split (no augmentation)")
     print("=" * 65)
 
     for epoch in range(start_epoch, args.epochs):

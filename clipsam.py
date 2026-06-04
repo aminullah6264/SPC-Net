@@ -42,7 +42,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from PIL import Image
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, ConcatDataset
 import open_clip
 from segment_anything import sam_model_registry
 from sklearn.cluster import KMeans
@@ -1892,6 +1892,8 @@ def parse_args():
                    help="Number of ESC blocks (paper uses N=4)")
     p.add_argument('--num-prompts',  type=int,   default=5)
     p.add_argument('--threshold',    type=float, default=0.5)
+    p.add_argument('--train-with-val-data', action='store_true',
+                   help="Research-only: append the dedicated validation split to the training loader. Validation is still evaluated/calibrated after training, so reported validation metrics are no longer held-out.")
     # Misc
     p.add_argument('--resume',       default=None,
                    help="Path to checkpoint to resume from")
@@ -1990,6 +1992,14 @@ def main():
         # ── Dataset & loader ─────────────────────────────────────────────────
         train_ds = ISICDataset(args.img_path, args.mask_path, captions,
                                augment=True)
+        if args.train_with_val_data:
+            val_train_ds = ISICDataset(args.val_img, args.val_mask, {},
+                                       augment=True)
+            train_ds = ConcatDataset([train_ds, val_train_ds])
+            print("[WARN] Research mode enabled: validation split appended to "
+                  "training data. Validation metrics/threshold calibration "
+                  "are no longer held-out.")
+            print(f"[INFO] Combined train samples: {len(train_ds)}")
         train_dl = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
                               num_workers=args.num_workers, pin_memory=True,
                               drop_last=True)
