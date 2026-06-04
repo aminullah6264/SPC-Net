@@ -13,7 +13,7 @@ server-proven plumbing as clipsam.py so it runs in the same environment:
 
 Architecture
     CLIP ViT-B/16 encoder  →  taps 4 transformer blocks (multi-scale)
-    UNet CNN decoder       →  4 upsampling stages + a high-res raw-image skip
+    UNet CNN decoder       →  4 upsampling stages + optional high-res raw-image skip
     Loss                   →  0.4·BCE + 0.4·Dice + 0.2·Boundary
 
 Bugs fixed relative to the student's version
@@ -270,7 +270,7 @@ class ConvBlock(nn.Module):
 
 class CLIPUNetDecoder(nn.Module):
     """
-    4-stage UNet decoder with CLIP skip connections + a high-res raw-image skip.
+    4-stage UNet decoder with CLIP skip connections + optional high-res raw-image skip.
 
     All CLIP taps are at the patch grid (g×g).  The decoder progressively
     upsamples ×2 per stage and fuses the corresponding (upsampled) CLIP tap:
@@ -278,14 +278,15 @@ class CLIPUNetDecoder(nn.Module):
         stage0  bottleneck : proj(deep)            → 256ch  @ g
         stage1             : up + proj(mid-deep)   → 128ch  @ 2g
         stage2             : up + proj(early-mid)  →  64ch  @ 4g
-        stage3             : up + proj(shallow) + img_skip(32) → 32ch @ 8g
+        stage3             : up + proj(shallow) [+ img_skip(32)] → 32ch @ 8g
         head               : up → input_size, Conv1×1 → 1 logit
 
     Stage sizes are derived from the feature grid and input size at runtime,
     so any --clip-size works (student hardcoded 14/28/56/112/224).
     """
-    def __init__(self, clip_ch=768, dropout=0.2):
+    def __init__(self, clip_ch=768, dropout=0.2, use_raw_img_skip=True):
         super().__init__()
+        self.use_raw_img_skip = use_raw_img_skip
         # Dropout schedule: heaviest at the wide bottleneck, tapering to 0 at
         # the head so fine boundary detail is not randomly zeroed near output.
         d0, d1, d2, d3 = dropout, dropout * 0.75, dropout * 0.5, 0.0
@@ -302,31 +303,42 @@ class CLIPUNetDecoder(nn.Module):
             nn.Conv2d(clip_ch, 64, 1, bias=False),
             nn.BatchNorm2d(64), nn.ReLU(inplace=True))
 
-        # High-res raw-image skip → recovers edge detail ViT's grid lacks.
-        self.img_skip = nn.Sequential(
-            nn.Conv2d(3,  32, 3, padding=1, bias=False),
-            nn.BatchNorm2d(32), nn.ReLU(inplace=True),
-            nn.Conv2d(32, 32, 3, padding=1, bias=False),
-            nn.BatchNorm2d(32), nn.ReLU(inplace=True),
-        )
+        # Optional high-res raw-image skip → recovers edge detail ViT's grid lacks.
+        # Disable it for ablations that should use CLIP features only.
+        if self.use_raw_img_skip:
+            self.img_skip = nn.Sequential(
+                nn.Conv2d(3,  32, 3, padding=1, bias=False),
+                nn.BatchNorm2d(32), nn.ReLU(inplace=True),
+                nn.Conv2d(32, 32, 3, padding=1, bias=False),
+                nn.BatchNorm2d(32), nn.ReLU(inplace=True),
+            )
+            stage3_in = 64 + 64 + 32
+        else:
+            self.img_skip = None
+            stage3_in = 64 + 64
 
-        self.stage0 = ConvBlock(512,            256, p_drop=d0)
-        self.stage1 = ConvBlock(256 + 256,      128, p_drop=d1)
-        self.stage2 = ConvBlock(128 + 128,       64, p_drop=d2)
-        self.stage3 = ConvBlock(64  +  64 + 32,  32, p_drop=d3)
+        self.stage0 = ConvBlock(512,       256, p_drop=d0)
+        self.stage1 = ConvBlock(256 + 256, 128, p_drop=d1)
+        self.stage2 = ConvBlock(128 + 128,  64, p_drop=d2)
+        self.stage3 = ConvBlock(stage3_in,  32, p_drop=d3)
         self.head   = nn.Conv2d(32, 1, 1)
 
     @staticmethod
     def _up(x, size):
         return F.interpolate(x, size=size, mode='bilinear', align_corners=False)
 
-    def forward(self, maps, raw_img):
+    def forward(self, maps, raw_img=None):
         """
         maps    : [shallow, early-mid, mid-deep, deep], each (B, 768, g, g)
-        raw_img : normalised input (B, 3, S, S)
+        raw_img : optional normalised input (B, 3, S, S). Required only when
+                  ``use_raw_img_skip=True``; otherwise it is used only to infer
+                  the final output size.
         """
+        if self.use_raw_img_skip and raw_img is None:
+            raise ValueError("raw_img must be provided when use_raw_img_skip=True")
+
         g  = maps[0].shape[-1]            # patch grid (e.g. 21 @ 336)
-        S  = raw_img.shape[-1]            # input resolution (e.g. 336)
+        S  = raw_img.shape[-1] if raw_img is not None else g * 16
         s1, s2, s3 = g * 2, g * 4, g * 8  # per-stage spatial sizes
 
         f_deep = self.proj_deep(maps[3])  # bottleneck
@@ -334,16 +346,19 @@ class CLIPUNetDecoder(nn.Module):
         f_em   = self.proj_em(maps[1])
         f_sh   = self.proj_sh(maps[0])
 
-        img_feat = self.img_skip(self._up(raw_img, (s3, s3)))   # (B, 32, 8g, 8g)
+        img_feat = None
+        if self.use_raw_img_skip:
+            img_feat = self.img_skip(self._up(raw_img, (s3, s3)))  # (B,32,8g,8g)
 
         x = self.stage0(f_deep)                                 # @ g
         x = self.stage1(torch.cat([self._up(x, (s1, s1)),
                                    self._up(f_md, (s1, s1))], 1))   # @ 2g
         x = self.stage2(torch.cat([self._up(x, (s2, s2)),
                                    self._up(f_em, (s2, s2))], 1))   # @ 4g
-        x = self.stage3(torch.cat([self._up(x, (s3, s3)),
-                                   self._up(f_sh, (s3, s3)),
-                                   img_feat], 1))                   # @ 8g
+        stage3_inputs = [self._up(x, (s3, s3)), self._up(f_sh, (s3, s3))]
+        if img_feat is not None:
+            stage3_inputs.append(img_feat)
+        x = self.stage3(torch.cat(stage3_inputs, 1))                # @ 8g
         x = self._up(x, (S, S))
         return self.head(x)                                      # (B, 1, S, S)
 
@@ -351,11 +366,13 @@ class CLIPUNetDecoder(nn.Module):
 #  FULL MODEL
 # ─────────────────────────────────────────────────────────────────────────────
 class CLIPUNet(nn.Module):
-    def __init__(self, clip_visual, clip_size, dropout=0.2):
+    def __init__(self, clip_visual, clip_size, dropout=0.2,
+                 use_raw_img_skip=True):
         super().__init__()
         self.encoder = CLIPEncoder(clip_visual, clip_size)
         self.decoder = CLIPUNetDecoder(clip_ch=CLIPEncoder.FEAT_DIM,
-                                       dropout=dropout)
+                                       dropout=dropout,
+                                       use_raw_img_skip=use_raw_img_skip)
 
     def forward(self, x):
         maps = self.encoder(x)
@@ -617,6 +634,7 @@ def save_results_yaml(history: dict, best_dice: float, val_results: dict,
             'lr_min': args.lr_min,
             'weight_decay': args.weight_decay,
             'dropout': args.dropout,
+            'use_raw_img_skip': not args.no_raw_img_skip,
             'threshold': args.threshold,
             'train_with_val_data': args.train_with_val_data,
             'img_path': args.img_path,
@@ -671,6 +689,8 @@ def parse_args():
     p.add_argument('--dropout',     type=float, default=0.2,
                    help="Decoder Dropout2d rate at the bottleneck; tapers to "
                         "0 toward the head. Set 0 to disable.")
+    p.add_argument('--no-raw-img-skip', action='store_true',
+                   help="Disable the high-resolution raw-image skip in the UNet decoder for CLIP-feature-only ablations.")
     p.add_argument('--lr-min',      type=float, default=1e-6,
                    help="Cosine schedule floor (eta_min)")
     p.add_argument('--threshold',   type=float, default=0.5)
@@ -702,7 +722,8 @@ def main():
         force_quick_gelu=True)
 
     model = CLIPUNet(clip_model.visual, args.clip_size,
-                     dropout=args.dropout).to(device)
+                     dropout=args.dropout,
+                     use_raw_img_skip=not args.no_raw_img_skip).to(device)
 
     # Shape sanity check
     with torch.no_grad():
@@ -797,11 +818,12 @@ def main():
 
     print("=" * 65)
     print("  Encoder : CLIP ViT-B/16  blocks 2,5,8,11  (lr=%.0e)" % args.lr_clip)
-    print("  Decoder : UNet 4-stage + high-res image skip  (lr=%.0e, drop=%.2f)"
+    print("  Decoder : UNet 4-stage + optional raw-image skip  (lr=%.0e, drop=%.2f)"
           % (args.lr_dec, args.dropout))
     print("  Reg     : weight_decay=%.0e (weights only)  cosine→%.0e"
           % (args.weight_decay, args.lr_min))
     print("  Loss    : 0.4·BCE + 0.4·Dice + 0.2·Boundary")
+    print("  RawSkip : %s" % ("enabled" if not args.no_raw_img_skip else "disabled"))
     if args.train_with_val_data:
         print("  Val     : reused in training (research-only; not held out)")
     else:
