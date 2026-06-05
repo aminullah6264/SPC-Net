@@ -82,6 +82,7 @@ def find_mask_path(masks_dir, image_fn):
     base = os.path.splitext(image_fn)[0]
     for ext in ('.png', '.jpg', '.jpeg'):
         p = os.path.join(masks_dir, base + '_segmentation' + ext)
+        # p = os.path.join(masks_dir, base + ext)
         if os.path.exists(p):
             return p
     return None
@@ -284,7 +285,7 @@ class CLIPUNetDecoder(nn.Module):
     Stage sizes are derived from the feature grid and input size at runtime,
     so any --clip-size works (student hardcoded 14/28/56/112/224).
     """
-    def __init__(self, clip_ch=768, dropout=0.2, use_raw_img_skip=True):
+    def __init__(self, clip_ch=768, dropout=0.2, use_raw_img_skip=False):
         super().__init__()
         self.use_raw_img_skip = use_raw_img_skip
         # Dropout schedule: heaviest at the wide bottleneck, tapering to 0 at
@@ -367,7 +368,7 @@ class CLIPUNetDecoder(nn.Module):
 # ─────────────────────────────────────────────────────────────────────────────
 class CLIPUNet(nn.Module):
     def __init__(self, clip_visual, clip_size, dropout=0.2,
-                 use_raw_img_skip=True):
+                 use_raw_img_skip=False):
         super().__init__()
         self.encoder = CLIPEncoder(clip_visual, clip_size)
         self.decoder = CLIPUNetDecoder(clip_ch=CLIPEncoder.FEAT_DIM,

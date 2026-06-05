@@ -61,18 +61,28 @@ from typing import Optional
 #  PATHS  (local server — extracted by setup_dataset.py)
 # ─────────────────────────────────────────────────────────────────────────────
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DATASET  = '/mnt/data/users/av543f/datasets'
+# DATASET  = '/mnt/data/users/av543f/datasets'
 
-IMG_PATH               = os.path.join(DATASET, 'ISIC-2017_Training_Data')
-MASK_PATH              = os.path.join(DATASET, 'ISIC-2017_Training_Part1_GroundTruth')
-VALIDATION_IMAGES_PATH = os.path.join(DATASET, 'ISIC-2017_Validation_Data')
-VALIDATION_MASK_PATH   = os.path.join(DATASET, 'ISIC-2017_Validation_Part1_GroundTruth')
-TEST_IMAGES_PATH       = os.path.join(DATASET, 'ISIC-2017_Test_v2_Data')
-TEST_MASK_PATH         = os.path.join(DATASET, 'ISIC-2017_Test_v2_Part1_GroundTruth')    # GT released by ISIC-2017
-OUTPUT_DIR             = os.path.join(BASE_DIR, 'outputs')
+# IMG_PATH               = os.path.join(DATASET, 'ISIC-2017_Training_Data')
+# MASK_PATH              = os.path.join(DATASET, 'ISIC-2017_Training_Part1_GroundTruth')
+# VALIDATION_IMAGES_PATH = os.path.join(DATASET, 'ISIC-2017_Validation_Data')
+# VALIDATION_MASK_PATH   = os.path.join(DATASET, 'ISIC-2017_Validation_Part1_GroundTruth')
+# TEST_IMAGES_PATH       = os.path.join(DATASET, 'ISIC-2017_Test_v2_Data')
+# TEST_MASK_PATH         = os.path.join(DATASET, 'ISIC-2017_Test_v2_Part1_GroundTruth')    # GT released by ISIC-2017
+# OUTPUT_DIR             = os.path.join(BASE_DIR, 'outputs')
+
+DATASET  = '/mnt/data/users/av543f/datasets/SIP_Dataset/'
+
+IMG_PATH               = os.path.join(DATASET, 'Train/Images')
+MASK_PATH              = os.path.join(DATASET, 'Train/Masks')
+VALIDATION_IMAGES_PATH = os.path.join(DATASET, 'Test/Images')
+VALIDATION_MASK_PATH   = os.path.join(DATASET, 'Test/Masks')
+TEST_IMAGES_PATH       = os.path.join(DATASET, 'Test1/Images')
+TEST_MASK_PATH         = os.path.join(DATASET, 'Test1/Masks')    # GT released by ISIC-2017
+OUTPUT_DIR             = os.path.join(BASE_DIR, 'outputs_clipSAM')
 
 # More specific dermoscopy caption (better CLIP alignment)
-CAPTION = "a dermoscopic image of a skin lesion with irregular border"
+CAPTION = "a photo of person"
 
 # ── Multi-prompt bank ─────────────────────────────────────────────────────────
 # Diverse textual descriptions of skin lesions.  Each prompt is encoded
@@ -80,17 +90,39 @@ CAPTION = "a dermoscopic image of a skin lesion with irregular border"
 # the visual features are max-pooled so that ANY prompt that activates a
 # region (including small lesions) contributes to the final correlation map.
 SKIN_PROMPT_BANK = [
-    "a dermoscopic image of a skin lesion",
-    "melanoma with irregular borders and asymmetric pigmentation",
-    "a small malignant pigmented skin lesion",
-    "an atypical mole with varied coloration on dermoscopy",
-    "early stage skin cancer with dark irregular spots",
-    "a suspicious skin growth with satellite nodules or streaks",
-    "a dermoscopic view of a benign or malignant nevus",
-    "skin lesion showing regression areas or atypical vascular pattern",
-    "a photo of skin lesion",
-    "a photo of skin diseases"
+    "a photo of a person",
+    "a photo of a human",
+    "an image of a person",
+    "a picture of a human being",
+    "a photograph of someone",
+    "a photo containing a person",
+    "an image containing a human",
+    "a person visible in the image",
+    "a human standing in the scene",
+    "a real-world photo of a person",
 ]
+
+
+# # More specific dermoscopy caption (better CLIP alignment)
+# CAPTION = "a dermoscopic image of a skin lesion with irregular border"
+
+# # ── Multi-prompt bank ─────────────────────────────────────────────────────────
+# # Diverse textual descriptions of skin lesions.  Each prompt is encoded
+# # independently by the CLIP text encoder; their cosine-similarity maps with
+# # the visual features are max-pooled so that ANY prompt that activates a
+# # region (including small lesions) contributes to the final correlation map.
+# SKIN_PROMPT_BANK = [
+#     "a dermoscopic image of a skin lesion",
+#     "melanoma with irregular borders and asymmetric pigmentation",
+#     "a small malignant pigmented skin lesion",
+#     "an atypical mole with varied coloration on dermoscopy",
+#     "early stage skin cancer with dark irregular spots",
+#     "a suspicious skin growth with satellite nodules or streaks",
+#     "a dermoscopic view of a benign or malignant nevus",
+#     "skin lesion showing regression areas or atypical vascular pattern",
+#     "a photo of skin lesion",
+#     "a photo of skin diseases"
+# ]
 
 IMAGE_EXTENSIONS = ('.jpg', '.jpeg', '.png', '.bmp', '.tif', '.tiff')
 CLIP_SIZE = 336    # ViT-B/16 native resolution — matches paper
@@ -175,7 +207,8 @@ def find_mask_path(masks_dir, image_fn):
     """
     base = os.path.splitext(image_fn)[0]
     for ext in ('.png', '.jpg', '.jpeg'):
-        p = os.path.join(masks_dir, base + '_segmentation' + ext)
+        # p = os.path.join(masks_dir, base + '_segmentation' + ext)
+        p = os.path.join(masks_dir, base + ext)
         if os.path.exists(p):
             return p
     return None
@@ -1881,9 +1914,9 @@ def parse_args():
                    help="Use 16 on A100 80 GB; 4-8 on smaller GPU")
     p.add_argument('--num-workers',  type=int,   default=4,
                    help="Use 8 on server; 2-4 locally")
-    p.add_argument('--lr-pretrained',type=float, default=2e-5,
+    p.add_argument('--lr-pretrained',type=float, default=2e-6,
                    help="LR for CLIP attention + SAM decoder blocks")
-    p.add_argument('--lr-new',       type=float, default=2e-4,
+    p.add_argument('--lr-new',       type=float, default=2e-5,
                    help="LR for new layers (PPG, VLF, decoder)")
     p.add_argument('--weight-decay', type=float, default=1e-4)
     p.add_argument('--clip-size',    type=int,   default=CLIP_SIZE)
