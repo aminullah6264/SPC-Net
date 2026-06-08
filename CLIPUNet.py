@@ -1,27 +1,24 @@
 # -*- coding: utf-8 -*-
 """
-CLIPUNet.py — Skin-lesion segmentation with a CLIP ViT-B/16 encoder + UNet decoder.
+CLIPUNet.py — Skin-lesion segmentation with a pretrained Swin Transformer encoder + UNet decoder.
 
 This is a corrected, server-ready rewrite of a student's `clip_unet.py`
 (originally a Colab notebook).  It deliberately reuses the SAME
 server-proven plumbing as clipsam.py so it runs in the same environment:
-  • open_clip ViT-B/16 (pretrained='openai')          — not HuggingFace transformers
-  • hook-based multi-scale ViT feature extraction      — handles LND / NLD layouts
+  • torchvision Swin Transformer (ImageNet-1K pretrained weights)
+  • native hierarchical Swin feature maps at 1/4, 1/8, 1/16, and 1/32 scale
   • the albumentations-v2 augmentation pipeline         — same kwargs as clipsam.py
   • the ISIC-2017 `_segmentation.png` mask convention
   • headless matplotlib (Agg) for figure dumping
 
 Architecture
-    CLIP ViT-B/16 encoder  →  taps 4 transformer blocks (multi-scale)
-    UNet CNN decoder       →  4 upsampling stages + optional high-res raw-image skip
-    Loss                   →  0.4·BCE + 0.4·Dice + 0.2·Boundary
+    Swin Transformer encoder  →  hierarchical multi-scale feature extraction
+    UNet CNN decoder          →  4 upsampling stages + optional high-res raw-image skip
+    Loss                      →  0.4·BCE + 0.4·Dice + 0.2·Boundary
 
 Bugs fixed relative to the student's version
-    1. Tap/unfreeze mismatch.  The student unfroze encoder.layers[1,3,7,11]
-       but read hidden_states[1,3,7,11] (= outputs of layers 0,2,6,10), so
-       the layers being fine-tuned were NOT the ones whose features were used.
-       Here a forward hook on resblocks[idx] captures the output of block idx,
-       and the SAME blocks are unfrozen — taps and trainable layers align.
+    1. Replaced flat ViT-B/16 block taps with Swin's native hierarchical
+       feature pyramid, which is a better inductive match for UNet decoding.
     2. Boundary loss numerical crash.  `probs*edges + 1e-6` can exceed 1.0,
        which F.binary_cross_entropy rejects.  Reformulated as a clamped,
        edge-masked elementwise BCE.
@@ -45,10 +42,14 @@ import torch.nn as nn
 import torch.nn.functional as F
 from PIL import Image
 from torch.utils.data import Dataset, DataLoader, ConcatDataset
-import open_clip
-import albumentations as A
-from albumentations.pytorch import ToTensorV2
-import cv2
+from torchvision.models import (
+    Swin_B_Weights,
+    Swin_S_Weights,
+    Swin_T_Weights,
+    swin_b,
+    swin_s,
+    swin_t,
+)
 from torch.amp import autocast, GradScaler
 import matplotlib
 matplotlib.use('Agg')          # headless — no display on the server
@@ -70,9 +71,9 @@ TEST_MASK_PATH         = os.path.join(DATASET, 'ISIC-2017_Test_v2_Part1_GroundTr
 OUTPUT_DIR             = os.path.join(BASE_DIR, 'outputs_clipunet')
 
 IMAGE_EXTENSIONS = ('.jpg', '.jpeg', '.png', '.bmp', '.tif', '.tiff')
-CLIP_SIZE = 336                       # ViT-B/16 @ 336 → 21×21 patch grid
-CLIP_MEAN = (0.48145466, 0.4578275,  0.40821073)
-CLIP_STD  = (0.26862954, 0.26130258, 0.27577711)
+IMAGE_SIZE = 336                      # Swin uses a 4× patch stem → 84×84 first stage at 336
+IMAGENET_MEAN = (0.485, 0.456, 0.406)
+IMAGENET_STD  = (0.229, 0.224, 0.225)
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  MASK PATH RESOLUTION  (ISIC-2017 convention, from clipsam.py)
@@ -91,6 +92,9 @@ def find_mask_path(masks_dir, image_fn):
 #  AUGMENTATION  (albumentations v2 — identical kwargs to clipsam.py)
 # ─────────────────────────────────────────────────────────────────────────────
 def build_train_aug(size):
+    import albumentations as A
+    from albumentations.pytorch import ToTensorV2
+
     return A.Compose([
         A.Resize(size, size),
         A.HorizontalFlip(p=0.3),
@@ -117,14 +121,17 @@ def build_train_aug(size):
         A.CoarseDropout(num_holes_range=(1, 8),
                         hole_height_range=(1, 28), hole_width_range=(1, 28),
                         fill=0, p=0.1),
-        A.Normalize(mean=CLIP_MEAN, std=CLIP_STD),
+        A.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
         ToTensorV2(),
     ], additional_targets={'mask': 'mask'})
 
 def build_val_aug(size):
+    import albumentations as A
+    from albumentations.pytorch import ToTensorV2
+
     return A.Compose([
         A.Resize(size, size),
-        A.Normalize(mean=CLIP_MEAN, std=CLIP_STD),
+        A.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
         ToTensorV2(),
     ], additional_targets={'mask': 'mask'})
 
@@ -169,81 +176,73 @@ class SkinDataset(Dataset):
         return img_t, mask_t, fn
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  CLIP ENCODER  (open_clip ViT-B/16 + hook-based multi-scale taps)
+#  SWIN ENCODER  (torchvision Swin + pretrained ImageNet-1K weights)
 # ─────────────────────────────────────────────────────────────────────────────
-class CLIPEncoder(nn.Module):
+SWIN_SPECS = {
+    'swin_t': {'builder': swin_t, 'weights': Swin_T_Weights.IMAGENET1K_V1,
+               'channels': (96, 192, 384, 768)},
+    'swin_s': {'builder': swin_s, 'weights': Swin_S_Weights.IMAGENET1K_V1,
+               'channels': (96, 192, 384, 768)},
+    'swin_b': {'builder': swin_b, 'weights': Swin_B_Weights.IMAGENET1K_V1,
+               'channels': (128, 256, 512, 1024)},
+}
+
+
+def build_swin_backbone(model_name: str, pretrained: bool = True):
+    if model_name not in SWIN_SPECS:
+        raise ValueError(f"Unsupported Swin model '{model_name}'. Choose one of {sorted(SWIN_SPECS)}")
+    spec = SWIN_SPECS[model_name]
+    weights = spec['weights'] if pretrained else None
+    model = spec['builder'](weights=weights)
+    print(f"[INFO] Loaded {model_name} "
+          f"({'ImageNet-1K pretrained' if pretrained else 'random init'})")
+    return model, spec['channels']
+
+
+class SwinEncoder(nn.Module):
     """
-    Taps 4 transformer blocks of CLIP ViT-B/16 for multi-scale features.
+    Returns Swin's native hierarchical feature pyramid.
 
-    A forward hook on resblocks[idx] captures the OUTPUT of block idx, and the
-    SAME blocks are unfrozen for fine-tuning — so taps and trainable layers are
-    consistent (the student's version tapped and trained different layers).
-
-    HOOK_INDICES span the depth: shallow → early-mid → mid-deep → deep.
-    Every tap is at the ViT patch resolution (grid×grid, e.g. 21×21 @ 336).
+    torchvision's Swin features are NHWC tensors after each transformer stage.
+    We collect stages 1, 3, 5, and 7 and convert them to NCHW maps:
+      shallow   : 1/4  resolution
+      early-mid : 1/8  resolution
+      mid-deep  : 1/16 resolution
+      deep      : 1/32 resolution
+    This multi-resolution structure is a natural fit for UNet skip connections.
     """
-    HOOK_INDICES = [2, 5, 8, 11]   # 0-based block indices (out of 12)
-    FEAT_DIM     = 768             # ViT-B hidden dimension
+    STAGE_INDICES = (1, 3, 5, 7)
 
-    def __init__(self, clip_visual, clip_size):
+    def __init__(self, swin_model, fine_tune_stages=2):
         super().__init__()
-        self.clip_visual = clip_visual
-        self.grid        = clip_size // 16          # 21 for 336×336 inputs
-        self._cache: dict = {}
+        self.features = swin_model.features
+        fine_tune_stages = max(0, min(fine_tune_stages, len(self.STAGE_INDICES)))
+        trainable_feature_indices = set()
+        if fine_tune_stages > 0:
+            first_trainable_stage = self.STAGE_INDICES[-fine_tune_stages]
+            trainable_feature_indices.update(
+                i for i in range(first_trainable_stage, len(self.features)))
 
-        # Register hooks
-        self._handles = []
-        for level, idx in enumerate(self.HOOK_INDICES):
-            h = self.clip_visual.transformer.resblocks[idx].register_forward_hook(
-                self._make_hook(level))
-            self._handles.append(h)
-
-        # Freeze everything, then unfreeze the tapped blocks + the patch/pos
-        # embeddings (so the fine-tuned weights match the features we read).
-        for p in self.clip_visual.parameters():
-            p.requires_grad = False
-        for idx in self.HOOK_INDICES:
-            for p in self.clip_visual.transformer.resblocks[idx].parameters():
-                p.requires_grad = True
-        for attr in ('conv1', 'ln_pre'):
-            mod = getattr(self.clip_visual, attr, None)
-            if isinstance(mod, nn.Module):
-                for p in mod.parameters():
-                    p.requires_grad = True
-        for attr in ('class_embedding', 'positional_embedding'):
-            param = getattr(self.clip_visual, attr, None)
-            if isinstance(param, nn.Parameter):
-                param.requires_grad = True
+        for idx, block in enumerate(self.features):
+            requires_grad = idx in trainable_feature_indices
+            for p in block.parameters():
+                p.requires_grad = requires_grad
 
         n = sum(p.numel() for p in self.parameters() if p.requires_grad)
-        print(f"[CLIPEncoder] trainable: {n:,}  (blocks {self.HOOK_INDICES} + embeddings)")
+        print(f"[SwinEncoder] trainable: {n:,}  "
+              f"(last {fine_tune_stages} hierarchical stage(s))")
 
-    def _make_hook(self, level):
-        def hook(_m, _i, output):
-            self._cache[level] = output
-        return hook
-
-    def _tokens_to_spatial(self, tokens):
-        """Handle both open_clip token layouts → (B, C, grid, grid)."""
-        num_tokens = self.grid * self.grid + 1   # patches + CLS
-        if tokens.shape[0] == num_tokens:
-            # LND: (seq, B, C)
-            patches = tokens[1:]                          # (N, B, C)
-            B, C    = patches.shape[1], patches.shape[2]
-            return patches.permute(1, 2, 0).view(B, C, self.grid, self.grid)
-        # NLD: (B, seq, C)
-        patches = tokens[:, 1:, :]                        # (B, N, C)
-        B, _, C = patches.shape
-        return patches.permute(0, 2, 1).view(B, C, self.grid, self.grid)
+    @staticmethod
+    def _nhwc_to_nchw(x):
+        return x.permute(0, 3, 1, 2).contiguous().clamp(-100, 100)
 
     def forward(self, x):
-        """Returns 4 maps (B, 768, grid, grid): [shallow, early-mid, mid-deep, deep]."""
-        self._cache = {}
-        _ = self.clip_visual(x)   # fires hooks
-        # Clamp activations — unclamped fp16 ViT outputs can blow up after many
-        # epochs and cause NaN downstream (same guard clipsam.py uses).
-        return [self._tokens_to_spatial(self._cache[l]).clamp(-100, 100)
-                for l in range(len(self.HOOK_INDICES))]
+        maps = []
+        for idx, block in enumerate(self.features):
+            x = block(x)
+            if idx in self.STAGE_INDICES:
+                maps.append(self._nhwc_to_nchw(x))
+        return maps
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  UNET DECODER  (resolution-agnostic)
@@ -271,41 +270,37 @@ class ConvBlock(nn.Module):
 
 class CLIPUNetDecoder(nn.Module):
     """
-    4-stage UNet decoder with CLIP skip connections + optional high-res raw-image skip.
+    4-stage UNet decoder with Swin hierarchical skip connections + optional
+    high-res raw-image skip.
 
-    All CLIP taps are at the patch grid (g×g).  The decoder progressively
-    upsamples ×2 per stage and fuses the corresponding (upsampled) CLIP tap:
-
-        stage0  bottleneck : proj(deep)            → 256ch  @ g
-        stage1             : up + proj(mid-deep)   → 128ch  @ 2g
-        stage2             : up + proj(early-mid)  →  64ch  @ 4g
-        stage3             : up + proj(shallow) [+ img_skip(32)] → 32ch @ 8g
-        head               : up → input_size, Conv1×1 → 1 logit
-
-    Stage sizes are derived from the feature grid and input size at runtime,
-    so any --clip-size works (student hardcoded 14/28/56/112/224).
+    Swin already provides feature maps at different resolutions, so the decoder
+    follows the encoder hierarchy directly instead of upsampling same-grid ViT
+    taps.  For a 336×336 input, Swin-T emits approximately 84², 42², 21², and
+    11² maps; patch merging pads odd sizes as needed, and the decoder simply
+    uses the actual tensor sizes at runtime.
     """
-    def __init__(self, clip_ch=768, dropout=0.2, use_raw_img_skip=False):
+    def __init__(self, encoder_channels, dropout=0.2, use_raw_img_skip=False):
         super().__init__()
         self.use_raw_img_skip = use_raw_img_skip
+        sh_ch, em_ch, md_ch, deep_ch = encoder_channels
         # Dropout schedule: heaviest at the wide bottleneck, tapering to 0 at
         # the head so fine boundary detail is not randomly zeroed near output.
         d0, d1, d2, d3 = dropout, dropout * 0.75, dropout * 0.5, 0.0
         self.proj_deep = nn.Sequential(   # deepest tap → bottleneck
-            nn.Conv2d(clip_ch, 512, 1, bias=False),
+            nn.Conv2d(deep_ch, 512, 1, bias=False),
             nn.BatchNorm2d(512), nn.ReLU(inplace=True))
         self.proj_md   = nn.Sequential(   # mid-deep tap
-            nn.Conv2d(clip_ch, 256, 1, bias=False),
+            nn.Conv2d(md_ch, 256, 1, bias=False),
             nn.BatchNorm2d(256), nn.ReLU(inplace=True))
         self.proj_em   = nn.Sequential(   # early-mid tap
-            nn.Conv2d(clip_ch, 128, 1, bias=False),
+            nn.Conv2d(em_ch, 128, 1, bias=False),
             nn.BatchNorm2d(128), nn.ReLU(inplace=True))
         self.proj_sh   = nn.Sequential(   # shallow tap
-            nn.Conv2d(clip_ch, 64, 1, bias=False),
+            nn.Conv2d(sh_ch, 64, 1, bias=False),
             nn.BatchNorm2d(64), nn.ReLU(inplace=True))
 
-        # Optional high-res raw-image skip → recovers edge detail ViT's grid lacks.
-        # Disable it for ablations that should use CLIP features only.
+        # Optional high-res raw-image skip → recovers edge detail beyond Swin's
+        # 4× patch-stem resolution. Disable it for encoder-feature-only ablations.
         if self.use_raw_img_skip:
             self.img_skip = nn.Sequential(
                 nn.Conv2d(3,  32, 3, padding=1, bias=False),
@@ -330,7 +325,7 @@ class CLIPUNetDecoder(nn.Module):
 
     def forward(self, maps, raw_img=None):
         """
-        maps    : [shallow, early-mid, mid-deep, deep], each (B, 768, g, g)
+        maps    : [shallow, early-mid, mid-deep, deep] hierarchical Swin maps.
         raw_img : optional normalised input (B, 3, S, S). Required only when
                   ``use_raw_img_skip=True``; otherwise it is used only to infer
                   the final output size.
@@ -338,28 +333,28 @@ class CLIPUNetDecoder(nn.Module):
         if self.use_raw_img_skip and raw_img is None:
             raise ValueError("raw_img must be provided when use_raw_img_skip=True")
 
-        g  = maps[0].shape[-1]            # patch grid (e.g. 21 @ 336)
-        S  = raw_img.shape[-1] if raw_img is not None else g * 16
-        s1, s2, s3 = g * 2, g * 4, g * 8  # per-stage spatial sizes
+        S = raw_img.shape[-1] if raw_img is not None else maps[0].shape[-1] * 4
 
-        f_deep = self.proj_deep(maps[3])  # bottleneck
+        f_deep = self.proj_deep(maps[3])  # bottleneck, lowest resolution
         f_md   = self.proj_md(maps[2])
         f_em   = self.proj_em(maps[1])
         f_sh   = self.proj_sh(maps[0])
 
+        sh_size = f_sh.shape[-2:]
+        em_size = f_em.shape[-2:]
+        md_size = f_md.shape[-2:]
+
         img_feat = None
         if self.use_raw_img_skip:
-            img_feat = self.img_skip(self._up(raw_img, (s3, s3)))  # (B,32,8g,8g)
+            img_feat = self.img_skip(self._up(raw_img, sh_size))
 
-        x = self.stage0(f_deep)                                 # @ g
-        x = self.stage1(torch.cat([self._up(x, (s1, s1)),
-                                   self._up(f_md, (s1, s1))], 1))   # @ 2g
-        x = self.stage2(torch.cat([self._up(x, (s2, s2)),
-                                   self._up(f_em, (s2, s2))], 1))   # @ 4g
-        stage3_inputs = [self._up(x, (s3, s3)), self._up(f_sh, (s3, s3))]
+        x = self.stage0(f_deep)
+        x = self.stage1(torch.cat([self._up(x, md_size), f_md], 1))
+        x = self.stage2(torch.cat([self._up(x, em_size), f_em], 1))
+        stage3_inputs = [self._up(x, sh_size), f_sh]
         if img_feat is not None:
             stage3_inputs.append(img_feat)
-        x = self.stage3(torch.cat(stage3_inputs, 1))                # @ 8g
+        x = self.stage3(torch.cat(stage3_inputs, 1))
         x = self._up(x, (S, S))
         return self.head(x)                                      # (B, 1, S, S)
 
@@ -367,11 +362,11 @@ class CLIPUNetDecoder(nn.Module):
 #  FULL MODEL
 # ─────────────────────────────────────────────────────────────────────────────
 class CLIPUNet(nn.Module):
-    def __init__(self, clip_visual, clip_size, dropout=0.2,
-                 use_raw_img_skip=False):
+    def __init__(self, swin_model, encoder_channels, fine_tune_stages=2,
+                 dropout=0.2, use_raw_img_skip=False):
         super().__init__()
-        self.encoder = CLIPEncoder(clip_visual, clip_size)
-        self.decoder = CLIPUNetDecoder(clip_ch=CLIPEncoder.FEAT_DIM,
+        self.encoder = SwinEncoder(swin_model, fine_tune_stages=fine_tune_stages)
+        self.decoder = CLIPUNetDecoder(encoder_channels=encoder_channels,
                                        dropout=dropout,
                                        use_raw_img_skip=use_raw_img_skip)
 
@@ -588,7 +583,7 @@ def save_training_plots(history: dict, output_dir: str):
 
     epochs = list(range(1, len(history['loss']) + 1))
     fig, axes = plt.subplots(1, 3, figsize=(15, 4))
-    fig.suptitle('CLIPUNet Training Curves (ISIC-2017)',
+    fig.suptitle('Swin-UNet Training Curves (ISIC-2017)',
                  fontsize=13, fontweight='bold')
 
     panels = [
@@ -621,7 +616,7 @@ def save_results_yaml(history: dict, best_dice: float, val_results: dict,
                       best_epoch=None):
     """Write a structured results.yaml compatible with CLIPSAM-style analysis."""
     doc = {
-        'model': 'CLIPUNet',
+        'model': 'SwinUNet',
         'checkpoint': {
             'best_epoch': best_epoch,
             'best_val_dice': round(float(best_dice), 6),
@@ -629,8 +624,11 @@ def save_results_yaml(history: dict, best_dice: float, val_results: dict,
         'config': {
             'epochs': args.epochs,
             'batch_size': args.batch_size,
-            'clip_size': args.clip_size,
-            'lr_clip': args.lr_clip,
+            'image_size': args.image_size,
+            'swin_model': args.swin_model,
+            'pretrained': not args.no_pretrained,
+            'fine_tune_stages': args.fine_tune_stages,
+            'lr_encoder': args.lr_encoder,
             'lr_decoder': args.lr_dec,
             'lr_min': args.lr_min,
             'weight_decay': args.weight_decay,
@@ -651,7 +649,7 @@ def save_results_yaml(history: dict, best_dice: float, val_results: dict,
             'epoch_train_iou': [round(float(v), 6) for v in history.get('train_iou', [])],
             'epoch_val_dice': [round(float(v), 6) for v in history.get('val_dice', [])],
             'epoch_val_iou': [round(float(v), 6) for v in history.get('val_iou', [])],
-            'lr_clip': [round(float(v), 10) for v in history.get('lr_clip', [])],
+            'lr_encoder': [round(float(v), 10) for v in history.get('lr_encoder', [])],
             'lr_decoder': [round(float(v), 10) for v in history.get('lr_decoder', [])],
         },
         'validation': val_results,
@@ -666,7 +664,7 @@ def save_results_yaml(history: dict, best_dice: float, val_results: dict,
 #  ARGS
 # ─────────────────────────────────────────────────────────────────────────────
 def parse_args():
-    p = argparse.ArgumentParser(description="CLIP-UNet ISIC-2017 segmentation")
+    p = argparse.ArgumentParser(description="Swin-UNet ISIC-2017 segmentation")
     p.add_argument('--img-path',   default=IMG_PATH)
     p.add_argument('--mask-path',  default=MASK_PATH)
     p.add_argument('--val-img',    default=VALIDATION_IMAGES_PATH)
@@ -677,10 +675,18 @@ def parse_args():
     p.add_argument('--epochs',      type=int,   default=40)
     p.add_argument('--batch-size',  type=int,   default=8)
     p.add_argument('--num-workers', type=int,   default=4)
-    p.add_argument('--clip-size',   type=int,   default=CLIP_SIZE,
-                   help="Input resolution for CLIP ViT-B/16. Default 336 gives a 21×21 patch grid for higher-resolution features; use 224 for lower memory.")
-    p.add_argument('--lr-clip',     type=float, default=1e-5,
-                   help="LR for the fine-tuned CLIP blocks")
+    p.add_argument('--image-size', '--clip-size', dest='image_size',
+                   type=int, default=IMAGE_SIZE,
+                   help="Input resolution. Default 336 gives Swin feature maps at roughly 84/42/21/11; --clip-size is accepted as a backward-compatible alias.")
+    p.add_argument('--swin-model', choices=sorted(SWIN_SPECS), default='swin_t',
+                   help="torchvision Swin backbone to use with ImageNet-1K pretrained weights")
+    p.add_argument('--no-pretrained', action='store_true',
+                   help="Disable ImageNet-1K pretrained Swin weights (not recommended).")
+    p.add_argument('--fine-tune-stages', type=int, default=2,
+                   help="Number of final Swin hierarchical stages to fine-tune (0-4).")
+    p.add_argument('--lr-encoder', '--lr-clip', dest='lr_encoder',
+                   type=float, default=1e-5,
+                   help="LR for the fine-tuned Swin encoder stages; --lr-clip is accepted as a backward-compatible alias")
     p.add_argument('--lr-dec',      type=float, default=2e-4,
                    help="LR for the UNet decoder (lowered from 3e-4 to curb "
                         "fast memorisation of the 2k-image train set)")
@@ -691,7 +697,7 @@ def parse_args():
                    help="Decoder Dropout2d rate at the bottleneck; tapers to "
                         "0 toward the head. Set 0 to disable.")
     p.add_argument('--no-raw-img-skip', action='store_true',
-                   help="Disable the high-resolution raw-image skip in the UNet decoder for CLIP-feature-only ablations.")
+                   help="Disable the high-resolution raw-image skip in the UNet decoder for Swin-feature-only ablations.")
     p.add_argument('--lr-min',      type=float, default=1e-6,
                    help="Cosine schedule floor (eta_min)")
     p.add_argument('--threshold',   type=float, default=0.5)
@@ -713,24 +719,19 @@ def main():
     best_path = os.path.join(args.output_dir, 'clipunet_best.pth')
     last_path = os.path.join(args.output_dir, 'clipunet_last.pth')
 
-    # ── CLIP ViT-B/16 (open_clip — same loader as clipsam.py) ─────────────────
-    print("[INFO] Loading CLIP ViT-B/16 …")
-    clip_model, _, _ = open_clip.create_model_and_transforms(
-        model_name='ViT-B-16',
-        pretrained='openai',
-        device=device,
-        force_image_size=args.clip_size,
-        force_quick_gelu=True)
-
-    model = CLIPUNet(clip_model.visual, args.clip_size,
+    # ── Swin Transformer (torchvision ImageNet-1K pretrained weights) ─────────
+    swin_model, encoder_channels = build_swin_backbone(
+        args.swin_model, pretrained=not args.no_pretrained)
+    model = CLIPUNet(swin_model, encoder_channels,
+                     fine_tune_stages=args.fine_tune_stages,
                      dropout=args.dropout,
                      use_raw_img_skip=not args.no_raw_img_skip).to(device)
 
     # Shape sanity check
     with torch.no_grad():
-        dummy = torch.randn(2, 3, args.clip_size, args.clip_size, device=device)
+        dummy = torch.randn(2, 3, args.image_size, args.image_size, device=device)
         out   = model(dummy)
-        assert out.shape == (2, 1, args.clip_size, args.clip_size), \
+        assert out.shape == (2, 1, args.image_size, args.image_size), \
             f"bad output shape {out.shape}"
     print(f"[INFO] Shape check OK — output {tuple(out.shape)}")
 
@@ -750,7 +751,7 @@ def main():
         model.load_state_dict(state['model'] if 'model' in state else state)
         print(f"[INFO] Loaded {ckpt}")
         val_d, val_j = evaluate_loop(model, args.val_img, args.val_mask, device,
-                                     args.clip_size, args.threshold, "Validation")
+                                     args.image_size, args.threshold, "Validation")
         val_results = {'mean_dice': round(float(val_d.mean()), 6),
                        'std_dice': round(float(val_d.std()), 6),
                        'mean_iou': round(float(val_j.mean()), 6),
@@ -758,13 +759,13 @@ def main():
         test_results = None
         if os.path.isdir(args.test_img):
             td, tj = evaluate_loop(model, args.test_img, args.test_mask, device,
-                                   args.clip_size, args.threshold, "Test")
+                                   args.image_size, args.threshold, "Test")
             test_results = {'mean_dice': round(float(td.mean()), 6),
                             'std_dice': round(float(td.std()), 6),
                             'mean_iou': round(float(tj.mean()), 6),
                             'std_iou': round(float(tj.std()), 6)}
             save_visualisations(model, args.test_img, args.test_mask, device,
-                                args.clip_size,
+                                args.image_size,
                                 os.path.join(args.output_dir, 'test_outputs'),
                                 args.threshold)
         save_results_yaml(state.get('history', {}), state.get('best_dice', 0.0),
@@ -773,9 +774,9 @@ def main():
         return
 
     # ── Data ──────────────────────────────────────────────────────────────────
-    train_ds = SkinDataset(args.img_path, args.mask_path, args.clip_size, augment=True)
+    train_ds = SkinDataset(args.img_path, args.mask_path, args.image_size, augment=True)
     if args.train_with_val_data:
-        val_train_ds = SkinDataset(args.val_img, args.val_mask, args.clip_size,
+        val_train_ds = SkinDataset(args.val_img, args.val_mask, args.image_size,
                                    augment=True)
         train_ds = ConcatDataset([train_ds, val_train_ds])
         print("[WARN] Research mode enabled: validation split appended to "
@@ -785,7 +786,7 @@ def main():
                           num_workers=args.num_workers, pin_memory=True,
                           drop_last=True)
 
-    # ── Optimiser: two LR groups (CLIP vs decoder) × decay/no-decay ───────────
+    # ── Optimiser: two LR groups (Swin encoder vs decoder) × decay/no-decay ───────────
     # Weight decay is applied ONLY to conv/linear weights. BatchNorm scales,
     # biases, and all 1-D params are excluded — decaying them shrinks the
     # effective normalisation/offset and hurts more than it helps.
@@ -797,14 +798,23 @@ def main():
             (no_decay if p.ndim <= 1 else decay).append(p)
         return decay, no_decay
 
-    clip_d, clip_nd = split_decay(model.encoder)
+    enc_d, enc_nd = split_decay(model.encoder)
     dec_d,  dec_nd  = split_decay(model.decoder)
-    optimizer = torch.optim.AdamW([
-        {'params': clip_d,  'lr': args.lr_clip, 'weight_decay': args.weight_decay},
-        {'params': clip_nd, 'lr': args.lr_clip, 'weight_decay': 0.0},
-        {'params': dec_d,   'lr': args.lr_dec,  'weight_decay': args.weight_decay},
-        {'params': dec_nd,  'lr': args.lr_dec,  'weight_decay': 0.0},
+    param_groups = []
+    if enc_d:
+        param_groups.append({'params': enc_d, 'lr': args.lr_encoder,
+                             'weight_decay': args.weight_decay,
+                             'name': 'encoder'})
+    if enc_nd:
+        param_groups.append({'params': enc_nd, 'lr': args.lr_encoder,
+                             'weight_decay': 0.0, 'name': 'encoder'})
+    param_groups.extend([
+        {'params': dec_d,  'lr': args.lr_dec, 'weight_decay': args.weight_decay,
+         'name': 'decoder'},
+        {'params': dec_nd, 'lr': args.lr_dec, 'weight_decay': 0.0,
+         'name': 'decoder'},
     ])
+    optimizer = torch.optim.AdamW(param_groups)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=args.epochs, eta_min=args.lr_min)
 
@@ -818,7 +828,9 @@ def main():
         print(f"[INFO] Resumed @ epoch {start_epoch}  best Dice {best_dice:.4f}")
 
     print("=" * 65)
-    print("  Encoder : CLIP ViT-B/16  blocks 2,5,8,11  (lr=%.0e)" % args.lr_clip)
+    print("  Encoder : %s  pretrained=%s  fine-tune-stages=%d  (lr=%.0e)"
+          % (args.swin_model, not args.no_pretrained, args.fine_tune_stages,
+             args.lr_encoder))
     print("  Decoder : UNet 4-stage + optional raw-image skip  (lr=%.0e, drop=%.2f)"
           % (args.lr_dec, args.dropout))
     print("  Reg     : weight_decay=%.0e (weights only)  cosine→%.0e"
@@ -833,13 +845,13 @@ def main():
 
     history = {
         'loss': [], 'train_dice': [], 'train_iou': [],
-        'val_dice': [], 'val_iou': [], 'lr_clip': [], 'lr_decoder': [],
+        'val_dice': [], 'val_iou': [], 'lr_encoder': [], 'lr_decoder': [],
     }
     best_epoch = None
     diag_path = os.path.join(args.output_dir, 'training_diagnostics.csv')
     diag_fields = [
         'epoch', 'loss', 'train_dice', 'train_iou', 'val_dice', 'val_iou',
-        'lr_clip', 'lr_decoder', 'grad_norm_mean', 'grad_norm_max',
+        'lr_encoder', 'lr_decoder', 'grad_norm_mean', 'grad_norm_max',
         'skipped_batches', 'amp_scale_start', 'amp_scale_end', 'best_val_dice',
     ]
     with open(diag_path, 'w', newline='') as f:
@@ -852,18 +864,20 @@ def main():
         scheduler.step()
 
         val_d, val_j = evaluate_loop(model, args.val_img, args.val_mask, device,
-                                     args.clip_size, args.threshold, "Validation")
+                                     args.image_size, args.threshold, "Validation")
         mean_val = float(val_d.mean())
         mean_val_iou = float(val_j.mean())
-        lr_clip = optimizer.param_groups[0]['lr']
-        lr_dec = optimizer.param_groups[2]['lr']
+        lr_encoder = next((g['lr'] for g in optimizer.param_groups
+                           if g.get('name') == 'encoder'), 0.0)
+        lr_dec = next(g['lr'] for g in optimizer.param_groups
+                      if g.get('name') == 'decoder')
 
         history['loss'].append(tr_loss)
         history['train_dice'].append(tr_d)
         history['train_iou'].append(tr_j)
         history['val_dice'].append(mean_val)
         history['val_iou'].append(mean_val_iou)
-        history['lr_clip'].append(lr_clip)
+        history['lr_encoder'].append(lr_encoder)
         history['lr_decoder'].append(lr_dec)
 
         print(f"Epoch [{epoch+1:02d}/{args.epochs}]  loss={tr_loss:.4f}  "
@@ -889,7 +903,7 @@ def main():
             'train_iou': round(float(tr_j), 6),
             'val_dice': round(float(mean_val), 6),
             'val_iou': round(float(mean_val_iou), 6),
-            'lr_clip': lr_clip,
+            'lr_encoder': lr_encoder,
             'lr_decoder': lr_dec,
             'grad_norm_mean': round(float(train_diag['grad_norm_mean']), 6),
             'grad_norm_max': round(float(train_diag['grad_norm_max']), 6),
@@ -910,7 +924,7 @@ def main():
     best_epoch = best_state.get('epoch', best_epoch)
 
     val_d, val_j = evaluate_loop(model, args.val_img, args.val_mask, device,
-                                 args.clip_size, args.threshold, "Validation")
+                                 args.image_size, args.threshold, "Validation")
     val_results = {'mean_dice': round(float(val_d.mean()), 6),
                    'std_dice': round(float(val_d.std()), 6),
                    'mean_iou': round(float(val_j.mean()), 6),
@@ -919,13 +933,13 @@ def main():
     test_results = None
     if os.path.isdir(args.test_img):
         td, tj = evaluate_loop(model, args.test_img, args.test_mask, device,
-                               args.clip_size, args.threshold, "Test")
+                               args.image_size, args.threshold, "Test")
         test_results = {'mean_dice': round(float(td.mean()), 6),
                         'std_dice': round(float(td.std()), 6),
                         'mean_iou': round(float(tj.mean()), 6),
                         'std_iou': round(float(tj.std()), 6)}
         save_visualisations(model, args.test_img, args.test_mask, device,
-                            args.clip_size,
+                            args.image_size,
                             os.path.join(args.output_dir, 'test_outputs'),
                             args.threshold)
 
