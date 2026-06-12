@@ -1036,6 +1036,191 @@ def batch_dice_iou(preds_probs, masks, threshold=0.5):
         js.append(iou_score (p[b, 0].numpy(), g[b, 0].numpy()))
     return float(np.mean(ds)), float(np.mean(js))
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  SIP / salient-object EVALUATION METRICS
+# ─────────────────────────────────────────────────────────────────────────────
+def _safe_div(num, den, eps=1e-12):
+    return num / (den + eps)
+
+
+def _prepare_saliency_arrays(pred_prob: np.ndarray, gt_mask: np.ndarray):
+    pred = np.asarray(pred_prob, dtype=np.float64)
+    gt   = np.asarray(gt_mask, dtype=np.float64)
+
+    if pred.max() > 1.0 or pred.min() < 0.0:
+        pred = np.clip(pred, 0, 255) / 255.0
+    pred = np.clip(pred, 0.0, 1.0)
+    gt_bin = gt > 0.5
+    return pred, gt_bin
+
+
+def f_measure_score(pred_bin: np.ndarray, gt_bin: np.ndarray,
+                    beta2: float = 0.3) -> float:
+    """Binary F-measure used by salient-object datasets such as SIP."""
+    pred = np.asarray(pred_bin, dtype=bool)
+    gt   = np.asarray(gt_bin, dtype=bool)
+    tp = np.logical_and(pred, gt).sum(dtype=np.float64)
+    precision = _safe_div(tp, pred.sum(dtype=np.float64))
+    recall    = _safe_div(tp, gt.sum(dtype=np.float64))
+    if precision == 0.0 and recall == 0.0:
+        return 0.0
+    return float(_safe_div((1.0 + beta2) * precision * recall,
+                           beta2 * precision + recall))
+
+
+def weighted_f_measure(pred_prob: np.ndarray, gt_bin: np.ndarray,
+                       beta2: float = 0.3) -> float:
+    """Weighted F-measure (WFβ) for binary salient-object evaluation."""
+    from scipy import ndimage
+
+    pred, gt = _prepare_saliency_arrays(pred_prob, gt_bin)
+    if not gt.any():
+        return 0.0
+
+    error = np.abs(pred - gt.astype(np.float64))
+    dist, idx = ndimage.distance_transform_edt(~gt, return_indices=True)
+
+    error_ext = error.copy()
+    bg = ~gt
+    error_ext[bg] = error[idx[0][bg], idx[1][bg]]
+    error_smooth = ndimage.gaussian_filter(error_ext, sigma=5, mode='constant', cval=0.0)
+
+    min_error = error.copy()
+    fg = gt
+    min_error[fg] = np.minimum(error[fg], error_smooth[fg])
+
+    # Pixel-importance weighting for background errors, matching the original
+    # WFβ implementation's distance-based falloff.
+    weights = np.ones_like(pred, dtype=np.float64)
+    weights[bg] = 2.0 - np.exp(np.log(0.5) / 5.0 * dist[bg])
+    weighted_error = min_error * weights
+
+    gt_sum = gt.sum(dtype=np.float64)
+    tp_w = gt_sum - weighted_error[fg].sum(dtype=np.float64)
+    fp_w = weighted_error[bg].sum(dtype=np.float64)
+    recall = 1.0 - _safe_div(weighted_error[fg].sum(dtype=np.float64), gt_sum)
+    precision = _safe_div(tp_w, tp_w + fp_w)
+    if precision == 0.0 and recall == 0.0:
+        return 0.0
+    return float(_safe_div((1.0 + beta2) * precision * recall,
+                           beta2 * precision + recall))
+
+
+def enhanced_measure(pred_bin: np.ndarray, gt_bin: np.ndarray) -> float:
+    """Enhanced-alignment measure (E-measure) for a binary prediction."""
+    pred = np.asarray(pred_bin, dtype=np.float64)
+    gt   = np.asarray(gt_bin, dtype=bool)
+
+    if gt.all():
+        return float(pred.mean())
+    if not gt.any():
+        return float(1.0 - pred.mean())
+
+    gt_float = gt.astype(np.float64)
+    pred_align = pred - pred.mean()
+    gt_align   = gt_float - gt_float.mean()
+    align = _safe_div(2.0 * pred_align * gt_align,
+                      pred_align ** 2 + gt_align ** 2)
+    enhanced = ((align + 1.0) ** 2) / 4.0
+    h, w = gt.shape
+    return float(_safe_div(enhanced.sum(dtype=np.float64), h * w - 1.0))
+
+
+def _s_object_component(region: np.ndarray) -> float:
+    if region.size == 0:
+        return 0.0
+    mean = region.mean(dtype=np.float64)
+    std = region.std(dtype=np.float64)
+    return float(_safe_div(2.0 * mean, mean ** 2 + 1.0 + std + 1e-12))
+
+
+def _s_object(pred: np.ndarray, gt: np.ndarray) -> float:
+    fg = pred[gt]
+    bg = 1.0 - pred[~gt]
+    u = gt.mean(dtype=np.float64)
+    return float(u * _s_object_component(fg) + (1.0 - u) * _s_object_component(bg))
+
+
+def _centroid(gt: np.ndarray):
+    h, w = gt.shape
+    if not gt.any():
+        return w // 2, h // 2
+    ys, xs = np.nonzero(gt)
+    x = int(np.round(xs.mean())) + 1
+    y = int(np.round(ys.mean())) + 1
+    return min(max(x, 1), w), min(max(y, 1), h)
+
+
+def _divide_with_weights(mat: np.ndarray, x: int, y: int):
+    h, w = mat.shape
+    lt = mat[:y, :x]
+    rt = mat[:y, x:]
+    lb = mat[y:, :x]
+    rb = mat[y:, x:]
+    area = float(h * w)
+    weights = [
+        (x * y) / area,
+        ((w - x) * y) / area,
+        (x * (h - y)) / area,
+        ((w - x) * (h - y)) / area,
+    ]
+    return (lt, rt, lb, rb), weights
+
+
+def _ssim(pred: np.ndarray, gt: np.ndarray) -> float:
+    if pred.size == 0:
+        return 0.0
+    x = pred.mean(dtype=np.float64)
+    y = gt.mean(dtype=np.float64)
+    n = pred.size
+    if n == 1:
+        return 1.0 - abs(x - y)
+    sigma_x = ((pred - x) ** 2).sum(dtype=np.float64) / (n - 1)
+    sigma_y = ((gt - y) ** 2).sum(dtype=np.float64) / (n - 1)
+    sigma_xy = ((pred - x) * (gt - y)).sum(dtype=np.float64) / (n - 1)
+    alpha = 4.0 * x * y * sigma_xy
+    beta = (x ** 2 + y ** 2) * (sigma_x + sigma_y)
+    if alpha != 0.0:
+        return float(_safe_div(alpha, beta))
+    if alpha == 0.0 and beta == 0.0:
+        return 1.0
+    return 0.0
+
+
+def _s_region(pred: np.ndarray, gt: np.ndarray) -> float:
+    x, y = _centroid(gt)
+    pred_parts, weights = _divide_with_weights(pred, x, y)
+    gt_parts, _ = _divide_with_weights(gt.astype(np.float64), x, y)
+    return float(sum(w * _ssim(p, g) for p, g, w in zip(pred_parts, gt_parts, weights)))
+
+
+def structure_measure(pred_prob: np.ndarray, gt_bin: np.ndarray,
+                      alpha: float = 0.5) -> float:
+    """S-measure: object-aware and region-aware structural similarity."""
+    pred, gt = _prepare_saliency_arrays(pred_prob, gt_bin)
+    y = gt.mean(dtype=np.float64)
+    if y == 0.0:
+        return float(1.0 - pred.mean(dtype=np.float64))
+    if y == 1.0:
+        return float(pred.mean(dtype=np.float64))
+    score = alpha * _s_object(pred, gt) + (1.0 - alpha) * _s_region(pred, gt)
+    return float(max(0.0, score))
+
+
+def sip_metric_scores(pred_prob: np.ndarray, gt_mask: np.ndarray,
+                      threshold: float = 0.5) -> dict:
+    """Return SIP metrics: E↑, S↑, weighted-F↑, F↑, MAE↓."""
+    pred, gt = _prepare_saliency_arrays(pred_prob, gt_mask)
+    pred_bin = pred >= threshold
+    return {
+        'e_measure':  enhanced_measure(pred_bin, gt),
+        's_measure':  structure_measure(pred, gt),
+        'weighted_f': weighted_f_measure(pred, gt),
+        'f_measure':  f_measure_score(pred_bin, gt),
+        'mae':        float(np.mean(np.abs(pred - gt.astype(np.float64)))),
+    }
+
 # ─────────────────────────────────────────────────────────────────────────────
 #  POINT CLASSIFICATION AUXILIARY LOSS
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1564,9 +1749,14 @@ def threshold_sweep(model, images_dir, masks_dir, device,
 
 def evaluate_loop(model, images_dir, masks_dir, device,
                   threshold=0.5, split_name="", use_postprocess=True,
-                  use_tta=True):
+                  use_tta=True, output_dir=None):
     model.eval()
     dice_list, iou_list, missing = [], [], 0
+    sip_metrics = {
+        'e_measure': [], 's_measure': [], 'weighted_f': [],
+        'f_measure': [], 'mae': []
+    }
+    per_image_rows = []
 
     image_files = sorted([f for f in os.listdir(images_dir)
                            if f.lower().endswith(IMAGE_EXTENSIONS)])
@@ -1598,24 +1788,67 @@ def evaluate_loop(model, images_dir, masks_dir, device,
                                   mode='bilinear', align_corners=False
                                   )[0, 0].cpu().numpy()
         pred_bin = (postprocess_mask(pred_np, threshold)
-                    if use_postprocess else pred_np > threshold)
+                    if use_postprocess else pred_np >= threshold)
 
-        dice_list.append(dice_score(pred_bin, gt_bin))
-        iou_list .append(iou_score (pred_bin, gt_bin))
+        dice = dice_score(pred_bin, gt_bin)
+        iou  = iou_score(pred_bin, gt_bin)
+        sip  = sip_metric_scores(pred_np, gt_bin, threshold=threshold)
+
+        dice_list.append(dice)
+        iou_list .append(iou)
+        for key, value in sip.items():
+            sip_metrics[key].append(value)
+
+        per_image_rows.append({
+            'filename': fn,
+            'dice': round(float(dice), 6),
+            'iou': round(float(iou), 6),
+            **{k: round(float(v), 6) for k, v in sip.items()},
+        })
+
+    if not dice_list:
+        print(f"[WARN] evaluate_loop: no paired images in {split_name}; skipping")
+        empty = np.array([], dtype=np.float64)
+        return {'dice': empty, 'iou': empty,
+                **{k: empty for k in sip_metrics}}
 
     dice_arr = np.array(dice_list)
     iou_arr  = np.array(iou_list)
+    result = {
+        'dice': dice_arr,
+        'iou': iou_arr,
+        **{k: np.array(v, dtype=np.float64) for k, v in sip_metrics.items()},
+    }
+
     pp       = "ON" if use_postprocess else "OFF"
-    print("=" * 56)
+    print("=" * 68)
     print(f"  Split      : {split_name}   (post-process {pp})")
     print(f"  Evaluated  : {len(dice_list)} images"
           + (f"  | Skipped: {missing}" if missing else ""))
-    print("-" * 56)
-    print(f"  Mean Dice  : {dice_arr.mean():.4f}  ±  {dice_arr.std():.4f}")
-    print(f"  Mean IoU   : {iou_arr.mean():.4f}  ±  {iou_arr.std():.4f}")
-    print(f"  Best Dice  : {dice_arr.max():.4f}    Worst Dice : {dice_arr.min():.4f}")
-    print("=" * 56)
-    return dice_arr, iou_arr
+    print("-" * 68)
+    print(f"  Mean Dice       : {dice_arr.mean():.4f}  ±  {dice_arr.std():.4f}")
+    print(f"  Mean IoU        : {iou_arr.mean():.4f}  ±  {iou_arr.std():.4f}")
+    print(f"  E-Measure ↑     : {result['e_measure'].mean():.4f}  ±  {result['e_measure'].std():.4f}")
+    print(f"  S-Measure ↑     : {result['s_measure'].mean():.4f}  ±  {result['s_measure'].std():.4f}")
+    print(f"  Weighted-F ↑    : {result['weighted_f'].mean():.4f}  ±  {result['weighted_f'].std():.4f}")
+    print(f"  F-Measure ↑     : {result['f_measure'].mean():.4f}  ±  {result['f_measure'].std():.4f}")
+    print(f"  MAE ↓           : {result['mae'].mean():.4f}  ±  {result['mae'].std():.4f}")
+    print(f"  Best Dice       : {dice_arr.max():.4f}    Worst Dice : {dice_arr.min():.4f}")
+    print("=" * 68)
+
+    if output_dir is not None and per_image_rows:
+        os.makedirs(output_dir, exist_ok=True)
+        safe_split = (split_name or 'split').strip().lower().replace(' ', '_')
+        metrics_csv = os.path.join(output_dir, f'{safe_split}_sip_metrics.csv')
+        fields = ['filename', 'dice', 'iou', 'e_measure', 's_measure',
+                  'weighted_f', 'f_measure', 'mae']
+        with open(metrics_csv, 'w', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=fields)
+            writer.writeheader()
+            writer.writerows(per_image_rows)
+        print(f"[INFO] Per-image SIP metrics saved → {metrics_csv}")
+
+    return result
 
 # ─────────────────────────────────────────────────────────────────────────────
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1795,16 +2028,27 @@ def save_results_yaml(history: dict,
       • validation metrics (mean, std, best, worst Dice / IoU)
       • test metrics (same)
     """
-    def arr_stats(arr: np.ndarray) -> dict:
+    def arr_stats(arr: dict) -> dict:
+        def stat_block(values: np.ndarray, higher_is_better: bool = True) -> dict:
+            if values.size == 0:
+                return {'mean': None, 'std': None, 'best': None, 'worst': None}
+            best = values.max() if higher_is_better else values.min()
+            worst = values.min() if higher_is_better else values.max()
+            return {
+                'mean':  float(f"{values.mean():.6f}"),
+                'std':   float(f"{values.std():.6f}"),
+                'best':  float(f"{best:.6f}"),
+                'worst': float(f"{worst:.6f}"),
+            }
+
         return {
-            'mean_dice':  float(f"{arr['dice'].mean():.6f}"),
-            'std_dice':   float(f"{arr['dice'].std():.6f}"),
-            'best_dice':  float(f"{arr['dice'].max():.6f}"),
-            'worst_dice': float(f"{arr['dice'].min():.6f}"),
-            'mean_iou':   float(f"{arr['iou'].mean():.6f}"),
-            'std_iou':    float(f"{arr['iou'].std():.6f}"),
-            'best_iou':   float(f"{arr['iou'].max():.6f}"),
-            'worst_iou':  float(f"{arr['iou'].min():.6f}"),
+            'dice':       stat_block(arr['dice']),
+            'iou':        stat_block(arr['iou']),
+            'e_measure':  stat_block(arr['e_measure']),
+            's_measure':  stat_block(arr['s_measure']),
+            'weighted_f': stat_block(arr['weighted_f']),
+            'f_measure':  stat_block(arr['f_measure']),
+            'mae':        stat_block(arr['mae'], higher_is_better=False),
             'n_samples':  int(len(arr['dice'])),
         }
 
@@ -1844,6 +2088,32 @@ def save_results_yaml(history: dict,
     with open(out_path, 'w') as f:
         yaml.dump(doc, f, default_flow_style=False, sort_keys=False)
     print(f"[INFO] Results YAML saved  → {out_path}")
+
+    summary_rows = []
+    for split, results in [('validation', val_results), ('test', test_results)]:
+        if results is None or len(results['dice']) == 0:
+            continue
+        summary_rows.append({
+            'split': split,
+            'threshold': round(calibrated_threshold, 4) if calibrated_threshold is not None else args.threshold,
+            'e_measure': round(float(results['e_measure'].mean()), 6),
+            's_measure': round(float(results['s_measure'].mean()), 6),
+            'weighted_f': round(float(results['weighted_f'].mean()), 6),
+            'f_measure': round(float(results['f_measure'].mean()), 6),
+            'mae': round(float(results['mae'].mean()), 6),
+            'dice': round(float(results['dice'].mean()), 6),
+            'iou': round(float(results['iou'].mean()), 6),
+            'n_samples': int(len(results['dice'])),
+        })
+    if summary_rows:
+        summary_path = os.path.join(output_dir, 'sip_results.csv')
+        fields = ['split', 'threshold', 'e_measure', 's_measure',
+                  'weighted_f', 'f_measure', 'mae', 'dice', 'iou', 'n_samples']
+        with open(summary_path, 'w', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=fields)
+            writer.writeheader()
+            writer.writerows(summary_rows)
+        print(f"[INFO] SIP result summary saved → {summary_path}")
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  OPTIMISER  — dual learning rate
@@ -2088,11 +2358,10 @@ def main():
         model, args.val_img, args.val_mask, device, use_tta=use_tta)
 
     # ── Validation evaluation (with calibrated threshold) ────────────────────
-    val_dice, val_iou = evaluate_loop(
+    val_results = evaluate_loop(
         model, args.val_img, args.val_mask, device,
         threshold=cal_thresh, split_name="Validation",
-        use_postprocess=True, use_tta=use_tta)
-    val_results = {'dice': val_dice, 'iou': val_iou}
+        use_postprocess=True, use_tta=use_tta, output_dir=args.output_dir)
 
     # ── Test evaluation (GT available for ISIC-2017) ──────────────────────────
     test_results   = None
@@ -2100,11 +2369,10 @@ def main():
     has_test_masks = os.path.isdir(args.test_mask) and bool(os.listdir(args.test_mask))
 
     if has_test_imgs and has_test_masks:
-        test_dice, test_iou = evaluate_loop(
+        test_results = evaluate_loop(
             model, args.test_img, args.test_mask, device,
             threshold=cal_thresh, split_name="Test",
-            use_postprocess=True, use_tta=use_tta)
-        test_results = {'dice': test_dice, 'iou': test_iou}
+            use_postprocess=True, use_tta=use_tta, output_dir=args.output_dir)
 
         # ── Optional threshold sweep on test set ──────────────────────────
         if args.threshold_sweep:
