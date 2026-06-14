@@ -12,6 +12,14 @@ This branch is configured for CLIP+SAM segmentation experiments on the **SIP dat
 
 Dice and IoU are still reported for debugging and comparison, but the SIP table should use **E-Measure**, **S-Measure**, **Weighted-F**, **F-Measure**, and **MAE**.
 
+The training objective is configured for salient object detection as:
+
+```text
+L = 0.6·Tversky + 0.4·BoundaryFocalBCE + λ·MSE + auxiliary/deep-supervision terms
+```
+
+The MSE term is controlled by `--mse-lambda` and is logged in `training_diagnostics.csv` as `loss_mse`.
+
 ## Repository files
 
 - `clipsam.py` — main training, validation, test, visualization, and SIP evaluation pipeline.
@@ -69,6 +77,7 @@ python clipsam.py \
   --epochs 60 \
   --batch-size 8 \
   --num-workers 4 \
+  --mse-lambda 0.1 \
   --output-dir outputs_clipSAM
 ```
 
@@ -83,11 +92,14 @@ python clipsam.py \
   --test-img /path/to/SIP_Dataset/Test1/Images \
   --test-mask /path/to/SIP_Dataset/Test1/Masks \
   --output-dir outputs_clipSAM \
+  --mse-lambda 0.1 \
   --epochs 60 \
   --batch-size 8
 ```
 
 During evaluation, the pipeline calibrates a threshold on the validation split and applies that calibrated threshold to validation and test reporting.
+
+`--mse-lambda` sets the λ coefficient on the probability-space MSE term. Use `0.0` to disable MSE and recover the previous Tversky + Focal objective.
 
 ## Test-only evaluation
 
@@ -106,7 +118,7 @@ If `--resume` is omitted, test-only mode looks for `escnet_best.pth` inside `--o
 
 After validation/test evaluation, the output directory contains:
 
-- `results.yaml` — training configuration, threshold information, and metric summaries.
+- `results.yaml` — training configuration, including `mse_lambda`, threshold information, and metric summaries.
 - `sip_results.csv` — compact table with validation/test aggregate SIP metrics:
   - `e_measure`
   - `s_measure`
