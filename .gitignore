@@ -9,3 +9,5 @@ __pycache__/
 
 # macOS
 .DS_Store
+SIP_Dataset
+SIP_Dataset*
