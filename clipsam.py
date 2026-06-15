@@ -108,7 +108,7 @@ train_aug = A.Compose([
     # ShiftScaleRotate is a special case of Affine; use Affine directly (v2+)
     A.Affine(translate_percent={"x": (-0.05, 0.05), "y": (-0.05, 0.05)},
              scale=(0.85, 1.15), rotate=(-45, 45), p=0.4,
-             mode=cv2.BORDER_REFLECT_101),
+             border_mode=cv2.BORDER_REFLECT_101),
     A.ElasticTransform(alpha=80, sigma=8, p=0.3),
     A.OneOf([
         A.GridDistortion(num_steps=5, distort_limit=0.3, p=0.5),
@@ -1366,7 +1366,9 @@ def train_loop(model, dataloader, optimizer, scheduler, device, epochs,
     # init_scale=4096: the default (65536) dropped 4× in epoch 1 every run,
     # so pre-set it to the stable value.  growth_interval=2000 avoids
     # re-growing aggressively and triggering new overflows.
-    scaler     = GradScaler('cuda', init_scale=4096.0, growth_interval=2000)
+    use_amp = torch.device(device).type == 'cuda'
+    scaler  = GradScaler('cuda', init_scale=4096.0, growth_interval=2000,
+                         enabled=use_amp)
     best_dice  = 0.0
     last_path  = save_path.replace('escnet_best.pth', 'escnet_last.pth')
     # "clean" checkpoint: only saved when the epoch has ZERO NaN batches.
@@ -1405,7 +1407,7 @@ def train_loop(model, dataloader, optimizer, scheduler, device, epochs,
             imgs, masks = imgs.to(device), masks.to(device)
             tokens      = tokenizer(caps).to(device)
 
-            with autocast('cuda'):
+            with autocast(torch.device(device).type, enabled=use_amp):
                 preds_logits, aux = model(imgs, tokens)
 
                 # ── Detect NaN in model output before touching the loss ────────
@@ -2148,6 +2150,47 @@ def build_optimizer(model: ESCNet, clip_model, _sam_model,
     ])
 
 # ─────────────────────────────────────────────────────────────────────────────
+#  DEVICE SELECTION
+# ─────────────────────────────────────────────────────────────────────────────
+def resolve_device(args) -> str:
+    """Select a training device and fail fast when CUDA is requested but unusable."""
+    requested = args.device.lower()
+    if requested == 'auto':
+        if torch.cuda.is_available():
+            return 'cuda'
+        if args.allow_cpu:
+            print('[WARN] CUDA is not available; falling back to CPU because --allow-cpu was set.')
+            return 'cpu'
+        raise RuntimeError(
+            'CUDA is not available to PyTorch, so training would run on CPU.\n'
+            'Your nvidia-smi output can still show GPUs while PyTorch cannot use them. '
+            'This commonly happens when the installed PyTorch CUDA build requires a newer '
+            'driver than the system provides. In your log, PyTorch reported driver CUDA '
+            'version 12020 while the installed build expects a newer driver.\n\n'
+            'Fix one of these, then rerun:\n'
+            '  1) Install a PyTorch build compatible with the cluster driver/CUDA 12.2, or\n'
+            '  2) Ask the admin to update the NVIDIA driver, or\n'
+            '  3) Use --allow-cpu only for a tiny smoke test.\n\n'
+            'For A100 selection, you can also set CUDA_VISIBLE_DEVICES=0,1,2 before running.'
+        )
+
+    if requested == 'cpu':
+        if not args.allow_cpu:
+            raise RuntimeError('CPU was requested. Pass --allow-cpu to confirm this is intentional.')
+        return 'cpu'
+
+    if requested.startswith('cuda'):
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                f"{args.device} was requested, but PyTorch reports CUDA is unavailable. "
+                'Check your PyTorch CUDA build versus the installed NVIDIA driver, or run '
+                '`python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available())"`.'
+            )
+        return args.device
+
+    raise ValueError(f"Unsupported --device value: {args.device!r}. Use auto, cpu, cuda, or cuda:N.")
+
+# ─────────────────────────────────────────────────────────────────────────────
 #  MAIN
 # ─────────────────────────────────────────────────────────────────────────────
 def parse_args():
@@ -2198,6 +2241,10 @@ def parse_args():
                    help="After main evaluation, sweep all candidate thresholds "
                         "on the test set and save per-threshold Dice/IoU to "
                         "threshold_sweep_test.csv.  Requires test GT masks.")
+    p.add_argument('--device', default='auto',
+                   help="Device to use: auto, cuda, cuda:N, or cpu (default: auto)")
+    p.add_argument('--allow-cpu', action='store_true',
+                   help="Allow CPU execution when CUDA is unavailable or --device cpu is used")
     # LR milestones
     p.add_argument('--milestones', nargs='+', type=float, default=[0.5, 0.75],
                    metavar='F',
@@ -2212,7 +2259,7 @@ def parse_args():
 
 def main():
     args   = parse_args()
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    device = resolve_device(args)
     print(f"[INFO] Device : {device}")
     os.makedirs(args.output_dir, exist_ok=True)
 
@@ -2289,8 +2336,9 @@ def main():
                   "training data. Validation metrics/threshold calibration "
                   "are no longer held-out.")
             print(f"[INFO] Combined train samples: {len(train_ds)}")
+        pin_memory = torch.device(device).type == 'cuda'
         train_dl = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
-                              num_workers=args.num_workers, pin_memory=True,
+                              num_workers=args.num_workers, pin_memory=pin_memory,
                               drop_last=True)
 
         # ── Optimiser (dual LR) + scheduler ──────────────────────────────────

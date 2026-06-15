@@ -68,6 +68,27 @@ pip install -r requirements.txt
 
 > Note: OpenCV may require system libraries such as `libGL.so.1` in minimal Linux containers.
 
+## GPU / CUDA troubleshooting
+
+This branch now fails fast instead of silently training on CPU when PyTorch cannot see CUDA. If `nvidia-smi` shows A100 GPUs but `clipsam.py` reports CUDA is unavailable, the usual cause is a mismatch between the installed PyTorch CUDA build and the cluster NVIDIA driver. Check with:
+
+```bash
+python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available())"
+```
+
+For the server shown in the diagnostics (`Driver Version: 535.230.02`, `CUDA Version: 12.2`), install a PyTorch build compatible with that driver/CUDA stack, or ask the admin to update the NVIDIA driver. To choose a free A100, set `CUDA_VISIBLE_DEVICES` before running, for example:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python clipsam.py \
+  --epochs 60 \
+  --batch-size 8 \
+  --num-workers 4 \
+  --mse-lambda 0.1 \
+  --output-dir outputs_clipSAM_MSE
+```
+
+Use `--allow-cpu` only for tiny smoke tests; full 213M-parameter training on CPU is not practical.
+
 ## Training on SIP
 
 Run training with the default SIP paths:
