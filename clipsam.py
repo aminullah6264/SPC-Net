@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-ESC-Net adapted for ISIC-2017 Skin Lesion Segmentation
+ESC-Net adapted for SIP Salient Object Detection
 Paper : arXiv:2411.14723v2  "ESC-Net: Effective SAM Combination for
          Open-Vocabulary Semantic Segmentation"
-Domain: Binary lesion segmentation on ISIC-2017 dermoscopy dataset
+Domain: Binary salient object segmentation on the SIP dataset
 
 Changes from original Colab notebook
 ─────────────────────────────────────
@@ -11,8 +11,7 @@ Bug fixes
   • Removed Google Colab / Google Drive dependencies
   • Removed !pip shell-magic (use requirements.txt instead)
   • Fixed syntax error  `model.train()S` → `model.train()`
-  • Fixed ISIC-2017 mask naming: `<base>_segmentation.png`
-    (original code assumed an "imgx → imgy" convention that is wrong)
+  • Supports SIP-style mask naming where image and mask share a basename
 
 Architectural alignment with the paper
   • CLIP backbone: RN50 → ViT-B/16 @ 336 × 336  (paper §3.1)
@@ -29,7 +28,7 @@ Training improvements
                          2e-4 for new layers  (paper §4.1)
   • A100-tuned defaults: batch=16, num_workers=8
   • CLI argparse for every key hyperparameter
-  • Better caption: "a dermoscopic image of a skin lesion …"
+  • Salient-object caption/prompt bank for SIP experiments
 """
 
 import os
@@ -37,6 +36,8 @@ import csv
 import json
 import argparse
 import math
+import zipfile
+import io
 import numpy as np
 import torch
 import torch.nn as nn
@@ -61,16 +62,6 @@ from typing import Optional
 #  PATHS  (local server — extracted by setup_dataset.py)
 # ─────────────────────────────────────────────────────────────────────────────
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-# DATASET  = '/mnt/data/users/av543f/datasets'
-
-# IMG_PATH               = os.path.join(DATASET, 'ISIC-2017_Training_Data')
-# MASK_PATH              = os.path.join(DATASET, 'ISIC-2017_Training_Part1_GroundTruth')
-# VALIDATION_IMAGES_PATH = os.path.join(DATASET, 'ISIC-2017_Validation_Data')
-# VALIDATION_MASK_PATH   = os.path.join(DATASET, 'ISIC-2017_Validation_Part1_GroundTruth')
-# TEST_IMAGES_PATH       = os.path.join(DATASET, 'ISIC-2017_Test_v2_Data')
-# TEST_MASK_PATH         = os.path.join(DATASET, 'ISIC-2017_Test_v2_Part1_GroundTruth')    # GT released by ISIC-2017
-# OUTPUT_DIR             = os.path.join(BASE_DIR, 'outputs')
-
 DATASET  = '/mnt/data/users/av543f/datasets/SIP_Dataset/'
 
 IMG_PATH               = os.path.join(DATASET, 'Train/Images')
@@ -78,51 +69,31 @@ MASK_PATH              = os.path.join(DATASET, 'Train/Masks')
 VALIDATION_IMAGES_PATH = os.path.join(DATASET, 'Test/Images')
 VALIDATION_MASK_PATH   = os.path.join(DATASET, 'Test/Masks')
 TEST_IMAGES_PATH       = os.path.join(DATASET, 'Test1/Images')
-TEST_MASK_PATH         = os.path.join(DATASET, 'Test1/Masks')    # GT released by ISIC-2017
+TEST_MASK_PATH         = os.path.join(DATASET, 'Test1/Masks')
 OUTPUT_DIR             = os.path.join(BASE_DIR, 'outputs_clipSAM')
+PRETRAINED_DIR         = os.path.join(BASE_DIR, 'pretrained_models')
 
-# More specific dermoscopy caption (better CLIP alignment)
-CAPTION = "a photo of person"
+# Salient-object caption (better CLIP alignment for SIP)
+CAPTION = "a photo of a salient object"
 
 # ── Multi-prompt bank ─────────────────────────────────────────────────────────
-# Diverse textual descriptions of skin lesions.  Each prompt is encoded
+# Diverse textual descriptions of salient objects.  Each prompt is encoded
 # independently by the CLIP text encoder; their cosine-similarity maps with
 # the visual features are max-pooled so that ANY prompt that activates a
-# region (including small lesions) contributes to the final correlation map.
-SKIN_PROMPT_BANK = [
-    "a photo of a person",
-    "a photo of a human",
-    "an image of a person",
-    "a picture of a human being",
-    "a photograph of someone",
-    "a photo containing a person",
-    "an image containing a human",
-    "a person visible in the image",
-    "a human standing in the scene",
-    "a real-world photo of a person",
+# region (including small salient objects) contributes to the final correlation map.
+SALIENT_PROMPT_BANK = [
+    "a photo of a salient object",
+    "an image containing the main foreground object",
+    "a prominent object separated from the background",
+    "the most visually distinctive object in the scene",
+    "a foreground object with clear boundaries",
+    "a salient region in a natural image",
+    "the central object of interest",
+    "a high contrast object against its background",
+    "a complete object mask for the main subject",
+    "the object that attracts visual attention",
 ]
 
-
-# # More specific dermoscopy caption (better CLIP alignment)
-# CAPTION = "a dermoscopic image of a skin lesion with irregular border"
-
-# # ── Multi-prompt bank ─────────────────────────────────────────────────────────
-# # Diverse textual descriptions of skin lesions.  Each prompt is encoded
-# # independently by the CLIP text encoder; their cosine-similarity maps with
-# # the visual features are max-pooled so that ANY prompt that activates a
-# # region (including small lesions) contributes to the final correlation map.
-# SKIN_PROMPT_BANK = [
-#     "a dermoscopic image of a skin lesion",
-#     "melanoma with irregular borders and asymmetric pigmentation",
-#     "a small malignant pigmented skin lesion",
-#     "an atypical mole with varied coloration on dermoscopy",
-#     "early stage skin cancer with dark irregular spots",
-#     "a suspicious skin growth with satellite nodules or streaks",
-#     "a dermoscopic view of a benign or malignant nevus",
-#     "skin lesion showing regression areas or atypical vascular pattern",
-#     "a photo of skin lesion",
-#     "a photo of skin diseases"
-# ]
 
 IMAGE_EXTENSIONS = ('.jpg', '.jpeg', '.png', '.bmp', '.tif', '.tiff')
 CLIP_SIZE = 336    # ViT-B/16 native resolution — matches paper
@@ -130,7 +101,7 @@ CLIP_MEAN = (0.48145466, 0.4578275,  0.40821073)
 CLIP_STD  = (0.26862954, 0.26130258, 0.27577711)
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  AUGMENTATION  — dermoscopy-tuned (updated to 336 × 336)
+#  AUGMENTATION  — salient-object tuned (updated to 336 × 336)
 # ─────────────────────────────────────────────────────────────────────────────
 train_aug = A.Compose([
     A.Resize(CLIP_SIZE, CLIP_SIZE),
@@ -140,7 +111,7 @@ train_aug = A.Compose([
     # ShiftScaleRotate is a special case of Affine; use Affine directly (v2+)
     A.Affine(translate_percent={"x": (-0.05, 0.05), "y": (-0.05, 0.05)},
              scale=(0.85, 1.15), rotate=(-45, 45), p=0.4,
-             mode=cv2.BORDER_REFLECT_101),
+             border_mode=cv2.BORDER_REFLECT_101),
     A.ElasticTransform(alpha=80, sigma=8, p=0.3),
     A.OneOf([
         A.GridDistortion(num_steps=5, distort_limit=0.3, p=0.5),
@@ -200,10 +171,10 @@ def inspect_folder(folder, label=""):
 
 def find_mask_path(masks_dir, image_fn):
     """
-    ISIC-2017 mask naming convention:
-        image: ISIC_XXXXXXX.jpg
-        mask : ISIC_XXXXXXX_segmentation.png
-    Falls back to .jpg extension if .png not found.
+    SIP mask naming convention:
+        image: <base>.<ext>
+        mask : <base>.png or <base>.<ext>
+    Falls back across common mask extensions.
     """
     base = os.path.splitext(image_fn)[0]
     for ext in ('.png', '.jpg', '.jpeg'):
@@ -216,7 +187,7 @@ def find_mask_path(masks_dir, image_fn):
 # ─────────────────────────────────────────────────────────────────────────────
 #  DATASET
 # ─────────────────────────────────────────────────────────────────────────────
-class ISICDataset(Dataset):
+class SalientObjectDataset(Dataset):
     def __init__(self, images_dir, masks_dir, captions,
                  augment=False):
         self.images_dir = images_dir
@@ -272,15 +243,21 @@ class ISICDataset(Dataset):
 def download_sam_checkpoint(path):
     url = "https://dl.fbaipublicfiles.com/segment_anything/sam_vit_b_01ec64.pth"
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    if not os.path.exists(path):
-        print("[INFO] Downloading SAM ViT-B checkpoint …")
-        import requests
-        resp = requests.get(url, stream=True)
-        resp.raise_for_status()
-        with open(path, 'wb') as f:
-            for chunk in resp.iter_content(chunk_size=8192):
-                f.write(chunk)
-        print(f"[INFO] SAM checkpoint saved → {path}")
+    if os.path.exists(path):
+        print(f"[INFO] Reusing SAM checkpoint → {path}")
+        return path
+
+    print("[INFO] Downloading SAM ViT-B checkpoint once …")
+    import requests
+    tmp_path = path + '.tmp'
+    resp = requests.get(url, stream=True)
+    resp.raise_for_status()
+    with open(tmp_path, 'wb') as f:
+        for chunk in resp.iter_content(chunk_size=8192):
+            f.write(chunk)
+    os.replace(tmp_path, path)
+    print(f"[INFO] SAM checkpoint saved → {path}")
+    return path
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  LOSS FUNCTIONS
@@ -331,28 +308,38 @@ def sobel_edge_weight(mask_gt, device):
 
 
 class CompoundLoss(nn.Module):
-    """0.6 × Tversky  +  0.4 × boundary-weighted FocalBCE."""
-    def __init__(self, w_tversky=0.6, w_focal=0.4, gamma=2.0,
-                 tversky_alpha=0.7, tversky_beta=0.3):
+    """Tversky + boundary-weighted FocalBCE + λ·MSE objective."""
+    def __init__(self, w_tversky=0.6, w_focal=0.4, mse_lambda=0.1,
+                 gamma=2.0, tversky_alpha=0.7, tversky_beta=0.3):
         super().__init__()
         self.w_tversky = w_tversky
         self.w_focal   = w_focal
+        self.mse_lambda = mse_lambda
         self.tversky   = TverskyLoss(alpha=tversky_alpha, beta=tversky_beta)
         self.focal     = FocalBCE(gamma=gamma)
 
     def forward(self, pred_logits, target):
         edge_w = sobel_edge_weight(target, pred_logits.device)
+        probs = torch.sigmoid(pred_logits)
         return (self.w_tversky * self.tversky(pred_logits, target) +
-                self.w_focal   * self.focal(pred_logits, target, weight=edge_w))
+                self.w_focal   * self.focal(pred_logits, target, weight=edge_w) +
+                self.mse_lambda * F.mse_loss(probs, target))
 
     def forward_with_stats(self, pred_logits, target):
         """Return (total_loss, dict) where dict has per-component scalar values.
-        Avoids recomputing Tversky/Focal twice compared to calling forward + sub-losses."""
+        Avoids recomputing Tversky/Focal/MSE twice compared to calling forward + sub-losses."""
         edge_w  = sobel_edge_weight(target, pred_logits.device)
         tv_loss = self.tversky(pred_logits, target)
         fc_loss = self.focal(pred_logits, target, weight=edge_w)
-        total   = self.w_tversky * tv_loss + self.w_focal * fc_loss
-        return total, {'tversky': tv_loss.item(), 'focal': fc_loss.item()}
+        mse_loss = F.mse_loss(torch.sigmoid(pred_logits), target)
+        total = (self.w_tversky * tv_loss +
+                 self.w_focal * fc_loss +
+                 self.mse_lambda * mse_loss)
+        return total, {
+            'tversky': tv_loss.item(),
+            'focal': fc_loss.item(),
+            'mse': mse_loss.item(),
+        }
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  WINDOW ATTENTION BLOCK  (Swin-like, no timm dependency)
@@ -459,7 +446,7 @@ class PseudoPromptGenerator(nn.Module):
             # ── Step 2: adaptive fallback — guarantee at least min_pix pixels ─
             # After softmax over H×W pixels the average probability is ~1/(H*W).
             # threshold=0.1 requires 44× the average to activate, so flat/diffuse
-            # correlation maps (early training, small lesions) yield zero pixels.
+            # correlation maps (early training, small salient objects) yield zero pixels.
             # When that happens we fall back to the top top_fraction of the map
             # so SAMBlock always receives substantive spatial guidance.
             min_pix = (self.min_pixels
@@ -756,7 +743,7 @@ class MaskDecoder(nn.Module):
 # ─────────────────────────────────────────────────────────────────────────────
 class ESCNet(nn.Module):
     """
-    ESC-Net adapted for binary lesion segmentation.
+    ESC-Net adapted for binary salient object segmentation.
 
     Vision backbone : CLIP ViT-B/16  (replaces RN50 in original Colab code)
     Multi-scale features extracted via forward hooks on transformer blocks
@@ -921,10 +908,10 @@ class ESCNet(nn.Module):
             open_clip tokenizer (same one used for captions).
         device : str or torch.device
         prompts : list[str] | None
-            Defaults to SKIN_PROMPT_BANK.
+            Defaults to SALIENT_PROMPT_BANK.
         """
         if prompts is None:
-            prompts = SKIN_PROMPT_BANK
+            prompts = SALIENT_PROMPT_BANK
         tokens = bank_tokenizer(prompts).to(device)          # (K, L)
         with torch.no_grad():
             embeds = self._encode_text(tokens)               # (K, 512)
@@ -953,7 +940,7 @@ class ESCNet(nn.Module):
         When a prompt bank has been set up via `setup_prompt_bank`, this
         computes a correlation map for every bank prompt *plus* the per-sample
         caption, then takes the element-wise maximum over all prompts.
-        The maximum aggregation ensures that even small lesion regions that
+        The maximum aggregation ensures that even small salient-object regions that
         only respond to one specific prompt are not suppressed.
 
         Without a bank it falls back to the original single-prompt behaviour.
@@ -1035,6 +1022,191 @@ def batch_dice_iou(preds_probs, masks, threshold=0.5):
         ds.append(dice_score(p[b, 0].numpy(), g[b, 0].numpy()))
         js.append(iou_score (p[b, 0].numpy(), g[b, 0].numpy()))
     return float(np.mean(ds)), float(np.mean(js))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  SIP / salient-object EVALUATION METRICS
+# ─────────────────────────────────────────────────────────────────────────────
+def _safe_div(num, den, eps=1e-12):
+    return num / (den + eps)
+
+
+def _prepare_saliency_arrays(pred_prob: np.ndarray, gt_mask: np.ndarray):
+    pred = np.asarray(pred_prob, dtype=np.float64)
+    gt   = np.asarray(gt_mask, dtype=np.float64)
+
+    if pred.max() > 1.0 or pred.min() < 0.0:
+        pred = np.clip(pred, 0, 255) / 255.0
+    pred = np.clip(pred, 0.0, 1.0)
+    gt_bin = gt > 0.5
+    return pred, gt_bin
+
+
+def f_measure_score(pred_bin: np.ndarray, gt_bin: np.ndarray,
+                    beta2: float = 0.3) -> float:
+    """Binary F-measure used by salient-object datasets such as SIP."""
+    pred = np.asarray(pred_bin, dtype=bool)
+    gt   = np.asarray(gt_bin, dtype=bool)
+    tp = np.logical_and(pred, gt).sum(dtype=np.float64)
+    precision = _safe_div(tp, pred.sum(dtype=np.float64))
+    recall    = _safe_div(tp, gt.sum(dtype=np.float64))
+    if precision == 0.0 and recall == 0.0:
+        return 0.0
+    return float(_safe_div((1.0 + beta2) * precision * recall,
+                           beta2 * precision + recall))
+
+
+def weighted_f_measure(pred_prob: np.ndarray, gt_bin: np.ndarray,
+                       beta2: float = 0.3) -> float:
+    """Weighted F-measure (WFβ) for binary salient-object evaluation."""
+    from scipy import ndimage
+
+    pred, gt = _prepare_saliency_arrays(pred_prob, gt_bin)
+    if not gt.any():
+        return 0.0
+
+    error = np.abs(pred - gt.astype(np.float64))
+    dist, idx = ndimage.distance_transform_edt(~gt, return_indices=True)
+
+    error_ext = error.copy()
+    bg = ~gt
+    error_ext[bg] = error[idx[0][bg], idx[1][bg]]
+    error_smooth = ndimage.gaussian_filter(error_ext, sigma=5, mode='constant', cval=0.0)
+
+    min_error = error.copy()
+    fg = gt
+    min_error[fg] = np.minimum(error[fg], error_smooth[fg])
+
+    # Pixel-importance weighting for background errors, matching the original
+    # WFβ implementation's distance-based falloff.
+    weights = np.ones_like(pred, dtype=np.float64)
+    weights[bg] = 2.0 - np.exp(np.log(0.5) / 5.0 * dist[bg])
+    weighted_error = min_error * weights
+
+    gt_sum = gt.sum(dtype=np.float64)
+    tp_w = gt_sum - weighted_error[fg].sum(dtype=np.float64)
+    fp_w = weighted_error[bg].sum(dtype=np.float64)
+    recall = 1.0 - _safe_div(weighted_error[fg].sum(dtype=np.float64), gt_sum)
+    precision = _safe_div(tp_w, tp_w + fp_w)
+    if precision == 0.0 and recall == 0.0:
+        return 0.0
+    return float(_safe_div((1.0 + beta2) * precision * recall,
+                           beta2 * precision + recall))
+
+
+def enhanced_measure(pred_bin: np.ndarray, gt_bin: np.ndarray) -> float:
+    """Enhanced-alignment measure (E-measure) for a binary prediction."""
+    pred = np.asarray(pred_bin, dtype=np.float64)
+    gt   = np.asarray(gt_bin, dtype=bool)
+
+    if gt.all():
+        return float(pred.mean())
+    if not gt.any():
+        return float(1.0 - pred.mean())
+
+    gt_float = gt.astype(np.float64)
+    pred_align = pred - pred.mean()
+    gt_align   = gt_float - gt_float.mean()
+    align = _safe_div(2.0 * pred_align * gt_align,
+                      pred_align ** 2 + gt_align ** 2)
+    enhanced = ((align + 1.0) ** 2) / 4.0
+    h, w = gt.shape
+    return float(_safe_div(enhanced.sum(dtype=np.float64), h * w - 1.0))
+
+
+def _s_object_component(region: np.ndarray) -> float:
+    if region.size == 0:
+        return 0.0
+    mean = region.mean(dtype=np.float64)
+    std = region.std(dtype=np.float64)
+    return float(_safe_div(2.0 * mean, mean ** 2 + 1.0 + std + 1e-12))
+
+
+def _s_object(pred: np.ndarray, gt: np.ndarray) -> float:
+    fg = pred[gt]
+    bg = 1.0 - pred[~gt]
+    u = gt.mean(dtype=np.float64)
+    return float(u * _s_object_component(fg) + (1.0 - u) * _s_object_component(bg))
+
+
+def _centroid(gt: np.ndarray):
+    h, w = gt.shape
+    if not gt.any():
+        return w // 2, h // 2
+    ys, xs = np.nonzero(gt)
+    x = int(np.round(xs.mean())) + 1
+    y = int(np.round(ys.mean())) + 1
+    return min(max(x, 1), w), min(max(y, 1), h)
+
+
+def _divide_with_weights(mat: np.ndarray, x: int, y: int):
+    h, w = mat.shape
+    lt = mat[:y, :x]
+    rt = mat[:y, x:]
+    lb = mat[y:, :x]
+    rb = mat[y:, x:]
+    area = float(h * w)
+    weights = [
+        (x * y) / area,
+        ((w - x) * y) / area,
+        (x * (h - y)) / area,
+        ((w - x) * (h - y)) / area,
+    ]
+    return (lt, rt, lb, rb), weights
+
+
+def _ssim(pred: np.ndarray, gt: np.ndarray) -> float:
+    if pred.size == 0:
+        return 0.0
+    x = pred.mean(dtype=np.float64)
+    y = gt.mean(dtype=np.float64)
+    n = pred.size
+    if n == 1:
+        return 1.0 - abs(x - y)
+    sigma_x = ((pred - x) ** 2).sum(dtype=np.float64) / (n - 1)
+    sigma_y = ((gt - y) ** 2).sum(dtype=np.float64) / (n - 1)
+    sigma_xy = ((pred - x) * (gt - y)).sum(dtype=np.float64) / (n - 1)
+    alpha = 4.0 * x * y * sigma_xy
+    beta = (x ** 2 + y ** 2) * (sigma_x + sigma_y)
+    if alpha != 0.0:
+        return float(_safe_div(alpha, beta))
+    if alpha == 0.0 and beta == 0.0:
+        return 1.0
+    return 0.0
+
+
+def _s_region(pred: np.ndarray, gt: np.ndarray) -> float:
+    x, y = _centroid(gt)
+    pred_parts, weights = _divide_with_weights(pred, x, y)
+    gt_parts, _ = _divide_with_weights(gt.astype(np.float64), x, y)
+    return float(sum(w * _ssim(p, g) for p, g, w in zip(pred_parts, gt_parts, weights)))
+
+
+def structure_measure(pred_prob: np.ndarray, gt_bin: np.ndarray,
+                      alpha: float = 0.5) -> float:
+    """S-measure: object-aware and region-aware structural similarity."""
+    pred, gt = _prepare_saliency_arrays(pred_prob, gt_bin)
+    y = gt.mean(dtype=np.float64)
+    if y == 0.0:
+        return float(1.0 - pred.mean(dtype=np.float64))
+    if y == 1.0:
+        return float(pred.mean(dtype=np.float64))
+    score = alpha * _s_object(pred, gt) + (1.0 - alpha) * _s_region(pred, gt)
+    return float(max(0.0, score))
+
+
+def sip_metric_scores(pred_prob: np.ndarray, gt_mask: np.ndarray,
+                      threshold: float = 0.5) -> dict:
+    """Return SIP metrics: E↑, S↑, weighted-F↑, F↑, MAE↓."""
+    pred, gt = _prepare_saliency_arrays(pred_prob, gt_mask)
+    pred_bin = pred >= threshold
+    return {
+        'e_measure':  enhanced_measure(pred_bin, gt),
+        's_measure':  structure_measure(pred, gt),
+        'weighted_f': weighted_f_measure(pred, gt),
+        'f_measure':  f_measure_score(pred_bin, gt),
+        'mae':        float(np.mean(np.abs(pred - gt.astype(np.float64)))),
+    }
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  POINT CLASSIFICATION AUXILIARY LOSS
@@ -1188,21 +1360,24 @@ class WarmupCosineScheduler(torch.optim.lr_scheduler._LRScheduler):
 #     escnet_last.pth  — overwritten at the end of every epoch
 # ─────────────────────────────────────────────────────────────────────────────
 def train_loop(model, dataloader, optimizer, scheduler, device, epochs,
-               save_path, pp_loss_weight=0.3, ds_weight=0.3, threshold=0.5):
+               save_path, pp_loss_weight=0.3, ds_weight=0.3, threshold=0.5,
+               mse_lambda=0.1):
     """
     Training loop with:
       • Per-batch NaN/Inf loss guard (skips weight update, logs breakdown)
-      • Per-epoch component logging: Tversky, Focal, PP losses
+      • Per-epoch component logging: Tversky, Focal, MSE, PP losses
       • Gradient norm tracking (mean & max per epoch)
       • AMP scale-drop counter (each drop = GradScaler detected overflow)
       • CSV diagnostics file for post-hoc analysis
     """
-    criterion  = CompoundLoss(w_tversky=0.6, w_focal=0.4, gamma=2.0,
-                              tversky_alpha=0.7, tversky_beta=0.3)
+    criterion  = CompoundLoss(w_tversky=0.6, w_focal=0.4, mse_lambda=mse_lambda,
+                              gamma=2.0, tversky_alpha=0.7, tversky_beta=0.3)
     # init_scale=4096: the default (65536) dropped 4× in epoch 1 every run,
     # so pre-set it to the stable value.  growth_interval=2000 avoids
     # re-growing aggressively and triggering new overflows.
-    scaler     = GradScaler('cuda', init_scale=4096.0, growth_interval=2000)
+    use_amp = torch.device(device).type == 'cuda'
+    scaler  = GradScaler('cuda', init_scale=4096.0, growth_interval=2000,
+                         enabled=use_amp)
     best_dice  = 0.0
     last_path  = save_path.replace('escnet_best.pth', 'escnet_last.pth')
     # "clean" checkpoint: only saved when the epoch has ZERO NaN batches.
@@ -1214,8 +1389,8 @@ def train_loop(model, dataloader, optimizer, scheduler, device, epochs,
     history = {'loss': [], 'dice': [], 'iou': [], 'lr': []}
 
     # ── Write CSV header ──────────────────────────────────────────────────────
-    _fields = ['epoch', 'loss', 'loss_tversky', 'loss_focal', 'loss_pp',
-               'dice', 'iou', 'lr',
+    _fields = ['epoch', 'loss', 'loss_tversky', 'loss_focal', 'loss_mse',
+               'loss_pp', 'dice', 'iou', 'lr',
                'grad_norm_mean', 'grad_norm_max',
                'nan_batches', 'amp_scale_drops', 'amp_scale']
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
@@ -1231,7 +1406,7 @@ def train_loop(model, dataloader, optimizer, scheduler, device, epochs,
         model.train()
         total_loss = 0.0
         all_dice, all_iou = [], []
-        acc_tv, acc_fc, acc_pp = 0.0, 0.0, 0.0
+        acc_tv, acc_fc, acc_mse, acc_pp = 0.0, 0.0, 0.0, 0.0
         grad_norms: list = []
         nan_batches    = 0
         amp_scale_drops = 0
@@ -1241,7 +1416,7 @@ def train_loop(model, dataloader, optimizer, scheduler, device, epochs,
             imgs, masks = imgs.to(device), masks.to(device)
             tokens      = tokenizer(caps).to(device)
 
-            with autocast('cuda'):
+            with autocast(torch.device(device).type, enabled=use_amp):
                 preds_logits, aux = model(imgs, tokens)
 
                 # ── Detect NaN in model output before touching the loss ────────
@@ -1299,6 +1474,7 @@ def train_loop(model, dataloader, optimizer, scheduler, device, epochs,
                       f"non-finite loss  "
                       f"tv={_stats['tversky']:.4f}  "
                       f"fc={_stats['focal']:.4f}  "
+                      f"mse={_stats['mse']:.4f}  "
                       f"pp={loss_pp.item():.4f}  — skipping update")
                 optimizer.zero_grad()
                 # scaler.update() must NOT be called here — backward was never
@@ -1323,6 +1499,7 @@ def train_loop(model, dataloader, optimizer, scheduler, device, epochs,
             total_loss += loss.item()
             acc_tv     += _stats['tversky']
             acc_fc     += _stats['focal']
+            acc_mse    += _stats['mse']
             acc_pp     += loss_pp.item()
 
             preds_probs = torch.sigmoid(preds_r)
@@ -1340,6 +1517,7 @@ def train_loop(model, dataloader, optimizer, scheduler, device, epochs,
         max_gn   = float(max(grad_norms)     if grad_norms else 0.0)
         avg_tv   = float(acc_tv / n_valid)
         avg_fc   = float(acc_fc / n_valid)
+        avg_mse  = float(acc_mse / n_valid)
         avg_pp   = float(acc_pp / n_valid)
         cur_lr   = float(optimizer.param_groups[0]['lr'])
         amp_scale = float(scaler.get_scale())
@@ -1351,7 +1529,8 @@ def train_loop(model, dataloader, optimizer, scheduler, device, epochs,
 
         # ── Append diagnostics row ────────────────────────────────────────────
         row = {'epoch': epoch, 'loss': avg_loss,
-               'loss_tversky': avg_tv, 'loss_focal': avg_fc, 'loss_pp': avg_pp,
+               'loss_tversky': avg_tv, 'loss_focal': avg_fc,
+               'loss_mse': avg_mse, 'loss_pp': avg_pp,
                'dice': avg_dice, 'iou': avg_iou, 'lr': cur_lr,
                'grad_norm_mean': avg_gn, 'grad_norm_max': max_gn,
                'nan_batches': nan_batches,
@@ -1564,9 +1743,14 @@ def threshold_sweep(model, images_dir, masks_dir, device,
 
 def evaluate_loop(model, images_dir, masks_dir, device,
                   threshold=0.5, split_name="", use_postprocess=True,
-                  use_tta=True):
+                  use_tta=True, output_dir=None):
     model.eval()
     dice_list, iou_list, missing = [], [], 0
+    sip_metrics = {
+        'e_measure': [], 's_measure': [], 'weighted_f': [],
+        'f_measure': [], 'mae': []
+    }
+    per_image_rows = []
 
     image_files = sorted([f for f in os.listdir(images_dir)
                            if f.lower().endswith(IMAGE_EXTENSIONS)])
@@ -1598,24 +1782,284 @@ def evaluate_loop(model, images_dir, masks_dir, device,
                                   mode='bilinear', align_corners=False
                                   )[0, 0].cpu().numpy()
         pred_bin = (postprocess_mask(pred_np, threshold)
-                    if use_postprocess else pred_np > threshold)
+                    if use_postprocess else pred_np >= threshold)
 
-        dice_list.append(dice_score(pred_bin, gt_bin))
-        iou_list .append(iou_score (pred_bin, gt_bin))
+        dice = dice_score(pred_bin, gt_bin)
+        iou  = iou_score(pred_bin, gt_bin)
+        sip  = sip_metric_scores(pred_np, gt_bin, threshold=threshold)
+
+        dice_list.append(dice)
+        iou_list .append(iou)
+        for key, value in sip.items():
+            sip_metrics[key].append(value)
+
+        per_image_rows.append({
+            'filename': fn,
+            'dice': round(float(dice), 6),
+            'iou': round(float(iou), 6),
+            **{k: round(float(v), 6) for k, v in sip.items()},
+        })
+
+    if not dice_list:
+        print(f"[WARN] evaluate_loop: no paired images in {split_name}; skipping")
+        empty = np.array([], dtype=np.float64)
+        return {'dice': empty, 'iou': empty,
+                **{k: empty for k in sip_metrics}}
 
     dice_arr = np.array(dice_list)
     iou_arr  = np.array(iou_list)
+    result = {
+        'dice': dice_arr,
+        'iou': iou_arr,
+        **{k: np.array(v, dtype=np.float64) for k, v in sip_metrics.items()},
+    }
+
     pp       = "ON" if use_postprocess else "OFF"
-    print("=" * 56)
+    print("=" * 68)
     print(f"  Split      : {split_name}   (post-process {pp})")
     print(f"  Evaluated  : {len(dice_list)} images"
           + (f"  | Skipped: {missing}" if missing else ""))
-    print("-" * 56)
-    print(f"  Mean Dice  : {dice_arr.mean():.4f}  ±  {dice_arr.std():.4f}")
-    print(f"  Mean IoU   : {iou_arr.mean():.4f}  ±  {iou_arr.std():.4f}")
-    print(f"  Best Dice  : {dice_arr.max():.4f}    Worst Dice : {dice_arr.min():.4f}")
-    print("=" * 56)
-    return dice_arr, iou_arr
+    print("-" * 68)
+    print(f"  Mean Dice       : {dice_arr.mean():.4f}  ±  {dice_arr.std():.4f}")
+    print(f"  Mean IoU        : {iou_arr.mean():.4f}  ±  {iou_arr.std():.4f}")
+    print(f"  E-Measure ↑     : {result['e_measure'].mean():.4f}  ±  {result['e_measure'].std():.4f}")
+    print(f"  S-Measure ↑     : {result['s_measure'].mean():.4f}  ±  {result['s_measure'].std():.4f}")
+    print(f"  Weighted-F ↑    : {result['weighted_f'].mean():.4f}  ±  {result['weighted_f'].std():.4f}")
+    print(f"  F-Measure ↑     : {result['f_measure'].mean():.4f}  ±  {result['f_measure'].std():.4f}")
+    print(f"  MAE ↓           : {result['mae'].mean():.4f}  ±  {result['mae'].std():.4f}")
+    print(f"  Best Dice       : {dice_arr.max():.4f}    Worst Dice : {dice_arr.min():.4f}")
+    print("=" * 68)
+
+    if output_dir is not None and per_image_rows:
+        os.makedirs(output_dir, exist_ok=True)
+        safe_split = (split_name or 'split').strip().lower().replace(' ', '_')
+        metrics_csv = os.path.join(output_dir, f'{safe_split}_sip_metrics.csv')
+        fields = ['filename', 'dice', 'iou', 'e_measure', 's_measure',
+                  'weighted_f', 'f_measure', 'mae']
+        with open(metrics_csv, 'w', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=fields)
+            writer.writeheader()
+            writer.writerows(per_image_rows)
+        print(f"[INFO] Per-image SIP metrics saved → {metrics_csv}")
+
+    return result
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  BENCHMARK EVALUATION (directory and NPY datasets)
+# ─────────────────────────────────────────────────────────────────────────────
+def _as_rgb_uint8(arr: np.ndarray) -> np.ndarray:
+    arr = np.asarray(arr)
+    if arr.ndim == 2:
+        arr = np.stack([arr] * 3, axis=-1)
+    if arr.ndim == 3 and arr.shape[0] in (1, 3) and arr.shape[-1] not in (1, 3):
+        arr = np.transpose(arr, (1, 2, 0))
+    if arr.ndim == 3 and arr.shape[-1] == 1:
+        arr = np.repeat(arr, 3, axis=-1)
+    if arr.dtype != np.uint8:
+        arr = arr.astype(np.float32)
+        if arr.max() <= 1.0:
+            arr = arr * 255.0
+        arr = np.clip(arr, 0, 255).astype(np.uint8)
+    return arr[..., :3]
+
+
+def _as_mask_float(arr: np.ndarray) -> np.ndarray:
+    arr = np.asarray(arr)
+    if arr.ndim == 3:
+        if arr.shape[-1] == 1:
+            arr = arr[..., 0]
+        elif arr.shape[0] == 1:
+            arr = arr[0]
+        else:
+            arr = arr[..., 0]
+    arr = arr.astype(np.float32)
+    if arr.max() > 1.0:
+        arr = arr / 255.0
+    return np.clip(arr, 0.0, 1.0)
+
+
+def _samples_from_dirs(images_dir: str, masks_dir: str):
+    if not (os.path.isdir(images_dir) and os.path.isdir(masks_dir)):
+        return []
+    samples = []
+    for fn in sorted(f for f in os.listdir(images_dir) if f.lower().endswith(IMAGE_EXTENSIONS)):
+        mask_path = find_mask_path(masks_dir, fn)
+        if mask_path is None:
+            continue
+        image = np.array(Image.open(os.path.join(images_dir, fn)).convert('RGB'))
+        mask = np.array(Image.open(mask_path).convert('L'), dtype=np.float32) / 255.0
+        samples.append((fn, image, mask))
+    return samples
+
+
+def _samples_from_npy(images_path: str, masks_path: str):
+    if not (os.path.exists(images_path) and os.path.exists(masks_path)):
+        return []
+    images = np.load(images_path, allow_pickle=True)
+    masks = np.load(masks_path, allow_pickle=True)
+    if len(images) != len(masks):
+        raise ValueError(f"NPY image/mask count mismatch: {images_path} ({len(images)}) vs {masks_path} ({len(masks)})")
+    return [(f"{i:05d}.png", _as_rgb_uint8(images[i]), _as_mask_float(masks[i]))
+            for i in range(len(images))]
+
+
+def _load_npy_from_zip(zip_path: str, preferred: str):
+    if not os.path.exists(zip_path):
+        return None
+    with zipfile.ZipFile(zip_path) as zf:
+        npy_names = [n for n in zf.namelist() if n.lower().endswith('.npy')]
+        if not npy_names:
+            return None
+        preferred_names = [n for n in npy_names if preferred in os.path.basename(n).lower()]
+        name = preferred_names[0] if preferred_names else npy_names[0]
+        with zf.open(name) as f:
+            return np.load(io.BytesIO(f.read()), allow_pickle=True)
+
+
+def _samples_from_npy_zip(zip_path: str):
+    if not os.path.exists(zip_path):
+        return []
+    images = _load_npy_from_zip(zip_path, 'image')
+    masks = _load_npy_from_zip(zip_path, 'mask')
+    if masks is None:
+        masks = _load_npy_from_zip(zip_path, 'gt')
+    if masks is None:
+        masks = _load_npy_from_zip(zip_path, 'label')
+    if images is None or masks is None:
+        print(f"[WARN] Could not infer image/mask arrays from {zip_path}")
+        return []
+    if len(images) != len(masks):
+        raise ValueError(f"NPY zip image/mask count mismatch in {zip_path}: {len(images)} vs {len(masks)}")
+    return [(f"{i:05d}.png", _as_rgb_uint8(images[i]), _as_mask_float(masks[i]))
+            for i in range(len(images))]
+
+
+def load_benchmark_samples(root: str, name: str):
+    key = name.lower().replace('_', '-').replace(' ', '-')
+    if key == 'ecssd':
+        return _samples_from_dirs(os.path.join(root, 'ECSSD', 'images'),
+                                  os.path.join(root, 'ECSSD', 'ground_truth_mask'))
+    if key in ('dut-o', 'dut-omron'):
+        return _samples_from_dirs(os.path.join(root, 'DUT-O', 'DUT-OMRON-image'),
+                                  os.path.join(root, 'DUT-O', 'pixelwiseGT-new-PNG'))
+    if key in ('pascal-s', 'pascals'):
+        return _samples_from_npy(os.path.join(root, 'pascals_test_images.npy'),
+                                 os.path.join(root, 'pascals_test_masks.npy')) or \
+               _samples_from_npy_zip(os.path.join(root, 'pascal-s-npy.zip'))
+    if key in ('hku-is', 'hkuis'):
+        return _samples_from_npy_zip(os.path.join(root, 'HKU-IS-npy.zip'))
+    if key in ('duts-te', 'duts'):
+        candidates = [
+            (os.path.join(root, 'DUTS_Dataset', 'DUTS-TE', 'DUTS-TE-Image'),
+             os.path.join(root, 'DUTS_Dataset', 'DUTS-TE', 'DUTS-TE-Mask')),
+            (os.path.join(root, 'DUTS_Dataset', 'DUTS-TE-Image'),
+             os.path.join(root, 'DUTS_Dataset', 'DUTS-TE-Mask')),
+            (os.path.join(root, 'DUTS_Dataset', 'DUTS-TE', 'Images'),
+             os.path.join(root, 'DUTS_Dataset', 'DUTS-TE', 'Masks')),
+        ]
+        for img_dir, mask_dir in candidates:
+            samples = _samples_from_dirs(img_dir, mask_dir)
+            if samples:
+                return samples
+    return []
+
+
+def evaluate_samples_loop(model, samples, device, threshold=0.5, split_name='',
+                          use_postprocess=True, use_tta=True, output_dir=None):
+    model.eval()
+    metrics = {'dice': [], 'iou': [], 'e_measure': [], 's_measure': [],
+               'weighted_f': [], 'f_measure': [], 'mae': []}
+    rows = []
+    print(f"\n[INFO] Evaluating benchmark {split_name}"
+          + (" (TTA)" if use_tta else "") + f" — {len(samples)} images")
+    for fn, image_np, gt_np in samples:
+        image_np = _as_rgb_uint8(image_np)
+        gt_np = _as_mask_float(gt_np)
+        gt_bin = gt_np > 0.5
+        img_t = val_aug(image=image_np)['image'].float().unsqueeze(0).to(device)
+        tokens = tokenizer([CAPTION]).to(device)
+        if use_tta:
+            pred_probs = tta_predict(model, img_t, tokens)
+        else:
+            with torch.no_grad():
+                logits, _ = model(img_t, tokens)
+                pred_probs = torch.sigmoid(logits)
+        pred_np = F.interpolate(pred_probs, size=gt_np.shape,
+                                mode='bilinear', align_corners=False)[0, 0].cpu().numpy()
+        pred_bin = postprocess_mask(pred_np, threshold) if use_postprocess else pred_np >= threshold
+        sip = sip_metric_scores(pred_np, gt_bin, threshold=threshold)
+        dice = dice_score(pred_bin, gt_bin)
+        iou = iou_score(pred_bin, gt_bin)
+        values = {'dice': dice, 'iou': iou, **sip}
+        for k, v in values.items():
+            metrics[k].append(v)
+        rows.append({'filename': fn, **{k: round(float(v), 6) for k, v in values.items()}})
+
+    if not rows:
+        print(f"[WARN] No samples found for benchmark {split_name}")
+        empty = np.array([], dtype=np.float64)
+        return {k: empty for k in metrics}
+
+    result = {k: np.array(v, dtype=np.float64) for k, v in metrics.items()}
+    print("=" * 68)
+    print(f"  Benchmark      : {split_name}")
+    print(f"  Evaluated      : {len(rows)} images")
+    print("-" * 68)
+    print(f"  E-Measure ↑    : {result['e_measure'].mean():.4f}")
+    print(f"  S-Measure ↑    : {result['s_measure'].mean():.4f}")
+    print(f"  Weighted-F ↑   : {result['weighted_f'].mean():.4f}")
+    print(f"  F-Measure ↑    : {result['f_measure'].mean():.4f}")
+    print(f"  MAE ↓          : {result['mae'].mean():.4f}")
+    print("=" * 68)
+
+    if output_dir is not None:
+        os.makedirs(output_dir, exist_ok=True)
+        safe = split_name.lower().replace(' ', '_').replace('-', '_')
+        out_csv = os.path.join(output_dir, f'{safe}_sip_metrics.csv')
+        fields = ['filename', 'dice', 'iou', 'e_measure', 's_measure',
+                  'weighted_f', 'f_measure', 'mae']
+        with open(out_csv, 'w', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=fields)
+            writer.writeheader()
+            writer.writerows(rows)
+        print(f"[INFO] Benchmark per-image metrics saved → {out_csv}")
+    return result
+
+
+def evaluate_benchmark_suite(model, args, device, threshold, use_tta=True):
+    requested = args.eval_benchmarks or []
+    if any(x.lower() == 'all' for x in requested):
+        requested = ['ECSSD', 'DUT-O', 'DUTS-TE', 'HKU-IS', 'PASCAL-S']
+    summary = []
+    for name in requested:
+        samples = load_benchmark_samples(args.benchmark_root, name)
+        result = evaluate_samples_loop(model, samples, device, threshold=threshold,
+                                       split_name=name, use_tta=use_tta,
+                                       output_dir=args.output_dir)
+        if len(result['mae']) == 0:
+            continue
+        summary.append({
+            'dataset': name,
+            'threshold': round(float(threshold), 4),
+            'e_measure': round(float(result['e_measure'].mean()), 6),
+            's_measure': round(float(result['s_measure'].mean()), 6),
+            'weighted_f': round(float(result['weighted_f'].mean()), 6),
+            'f_measure': round(float(result['f_measure'].mean()), 6),
+            'mae': round(float(result['mae'].mean()), 6),
+            'dice': round(float(result['dice'].mean()), 6),
+            'iou': round(float(result['iou'].mean()), 6),
+            'n_samples': int(len(result['mae'])),
+        })
+    if summary:
+        out_csv = os.path.join(args.output_dir, 'benchmark_sip_results.csv')
+        fields = ['dataset', 'threshold', 'e_measure', 's_measure', 'weighted_f',
+                  'f_measure', 'mae', 'dice', 'iou', 'n_samples']
+        with open(out_csv, 'w', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=fields)
+            writer.writeheader()
+            writer.writerows(summary)
+        print(f"[INFO] Benchmark summary saved → {out_csv}")
+    return summary
 
 # ─────────────────────────────────────────────────────────────────────────────
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1746,7 +2190,7 @@ def save_training_plots(history: dict, output_dir: str):
     epochs = list(range(1, len(history['loss']) + 1))
 
     fig, axes = plt.subplots(1, 3, figsize=(15, 4))
-    fig.suptitle('ESC-Net Training Curves (ISIC-2017)', fontsize=13, fontweight='bold')
+    fig.suptitle('ESC-Net Training Curves (SIP)', fontsize=13, fontweight='bold')
 
     panels = [
         ('loss', 'Compound Loss',   'tab:red'),
@@ -1795,16 +2239,27 @@ def save_results_yaml(history: dict,
       • validation metrics (mean, std, best, worst Dice / IoU)
       • test metrics (same)
     """
-    def arr_stats(arr: np.ndarray) -> dict:
+    def arr_stats(arr: dict) -> dict:
+        def stat_block(values: np.ndarray, higher_is_better: bool = True) -> dict:
+            if values.size == 0:
+                return {'mean': None, 'std': None, 'best': None, 'worst': None}
+            best = values.max() if higher_is_better else values.min()
+            worst = values.min() if higher_is_better else values.max()
+            return {
+                'mean':  float(f"{values.mean():.6f}"),
+                'std':   float(f"{values.std():.6f}"),
+                'best':  float(f"{best:.6f}"),
+                'worst': float(f"{worst:.6f}"),
+            }
+
         return {
-            'mean_dice':  float(f"{arr['dice'].mean():.6f}"),
-            'std_dice':   float(f"{arr['dice'].std():.6f}"),
-            'best_dice':  float(f"{arr['dice'].max():.6f}"),
-            'worst_dice': float(f"{arr['dice'].min():.6f}"),
-            'mean_iou':   float(f"{arr['iou'].mean():.6f}"),
-            'std_iou':    float(f"{arr['iou'].std():.6f}"),
-            'best_iou':   float(f"{arr['iou'].max():.6f}"),
-            'worst_iou':  float(f"{arr['iou'].min():.6f}"),
+            'dice':       stat_block(arr['dice']),
+            'iou':        stat_block(arr['iou']),
+            'e_measure':  stat_block(arr['e_measure']),
+            's_measure':  stat_block(arr['s_measure']),
+            'weighted_f': stat_block(arr['weighted_f']),
+            'f_measure':  stat_block(arr['f_measure']),
+            'mae':        stat_block(arr['mae'], higher_is_better=False),
             'n_samples':  int(len(arr['dice'])),
         }
 
@@ -1821,6 +2276,7 @@ def save_results_yaml(history: dict,
             'num_prompts':     int(args.num_prompts),
             'clip_size':       int(args.clip_size),
             'warmup_epochs':   int(args.warmup_ep),
+            'mse_lambda':      float(args.mse_lambda),
             # Full per-epoch history for later plotting or analysis
             'epoch_loss': [round(v, 6) for v in history['loss']],
             'epoch_dice': [round(v, 6) for v in history['dice']],
@@ -1845,6 +2301,32 @@ def save_results_yaml(history: dict,
         yaml.dump(doc, f, default_flow_style=False, sort_keys=False)
     print(f"[INFO] Results YAML saved  → {out_path}")
 
+    summary_rows = []
+    for split, results in [('validation', val_results), ('test', test_results)]:
+        if results is None or len(results['dice']) == 0:
+            continue
+        summary_rows.append({
+            'split': split,
+            'threshold': round(calibrated_threshold, 4) if calibrated_threshold is not None else args.threshold,
+            'e_measure': round(float(results['e_measure'].mean()), 6),
+            's_measure': round(float(results['s_measure'].mean()), 6),
+            'weighted_f': round(float(results['weighted_f'].mean()), 6),
+            'f_measure': round(float(results['f_measure'].mean()), 6),
+            'mae': round(float(results['mae'].mean()), 6),
+            'dice': round(float(results['dice'].mean()), 6),
+            'iou': round(float(results['iou'].mean()), 6),
+            'n_samples': int(len(results['dice'])),
+        })
+    if summary_rows:
+        summary_path = os.path.join(output_dir, 'sip_results.csv')
+        fields = ['split', 'threshold', 'e_measure', 's_measure',
+                  'weighted_f', 'f_measure', 'mae', 'dice', 'iou', 'n_samples']
+        with open(summary_path, 'w', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=fields)
+            writer.writeheader()
+            writer.writerows(summary_rows)
+        print(f"[INFO] SIP result summary saved → {summary_path}")
+
 # ─────────────────────────────────────────────────────────────────────────────
 #  OPTIMISER  — dual learning rate
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1857,7 +2339,7 @@ def build_optimizer(model: ESCNet, clip_model, _sam_model,
       new layers  (PPG / VLF / decoder)     → lr_new        (2e-4 default)
 
     Paper uses 2e-6 / 2e-4 for COCO-Stuff scale; we use 10× higher
-    for the CLIP/SAM group because the ISIC-2017 training set is much smaller.
+    for the CLIP/SAM group because the SIP training set is smaller than large-scale pretraining datasets.
     """
     pretrained_ids: set = set()
     pretrained_params, new_params = [], []
@@ -1894,10 +2376,51 @@ def build_optimizer(model: ESCNet, clip_model, _sam_model,
     ])
 
 # ─────────────────────────────────────────────────────────────────────────────
+#  DEVICE SELECTION
+# ─────────────────────────────────────────────────────────────────────────────
+def resolve_device(args) -> str:
+    """Select a training device and fail fast when CUDA is requested but unusable."""
+    requested = args.device.lower()
+    if requested == 'auto':
+        if torch.cuda.is_available():
+            return 'cuda'
+        if args.allow_cpu:
+            print('[WARN] CUDA is not available; falling back to CPU because --allow-cpu was set.')
+            return 'cpu'
+        raise RuntimeError(
+            'CUDA is not available to PyTorch, so training would run on CPU.\n'
+            'Your nvidia-smi output can still show GPUs while PyTorch cannot use them. '
+            'This commonly happens when the installed PyTorch CUDA build requires a newer '
+            'driver than the system provides. In your log, PyTorch reported driver CUDA '
+            'version 12020 while the installed build expects a newer driver.\n\n'
+            'Fix one of these, then rerun:\n'
+            '  1) Install a PyTorch build compatible with the cluster driver/CUDA 12.2, or\n'
+            '  2) Ask the admin to update the NVIDIA driver, or\n'
+            '  3) Use --allow-cpu only for a tiny smoke test.\n\n'
+            'For A100 selection, you can also set CUDA_VISIBLE_DEVICES=0,1,2 before running.'
+        )
+
+    if requested == 'cpu':
+        if not args.allow_cpu:
+            raise RuntimeError('CPU was requested. Pass --allow-cpu to confirm this is intentional.')
+        return 'cpu'
+
+    if requested.startswith('cuda'):
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                f"{args.device} was requested, but PyTorch reports CUDA is unavailable. "
+                'Check your PyTorch CUDA build versus the installed NVIDIA driver, or run '
+                '`python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available())"`.'
+            )
+        return args.device
+
+    raise ValueError(f"Unsupported --device value: {args.device!r}. Use auto, cpu, cuda, or cuda:N.")
+
+# ─────────────────────────────────────────────────────────────────────────────
 #  MAIN
 # ─────────────────────────────────────────────────────────────────────────────
 def parse_args():
-    p = argparse.ArgumentParser(description="ESC-Net ISIC-2017 segmentation")
+    p = argparse.ArgumentParser(description="ESC-Net SIP salient object segmentation")
     # Paths
     p.add_argument('--img-path',   default=IMG_PATH)
     p.add_argument('--mask-path',  default=MASK_PATH)
@@ -1905,8 +2428,20 @@ def parse_args():
     p.add_argument('--val-mask',   default=VALIDATION_MASK_PATH)
     p.add_argument('--test-img',   default=TEST_IMAGES_PATH)
     p.add_argument('--test-mask',  default=TEST_MASK_PATH,
-                   help="GT masks for test set — available for ISIC-2017")
+                   help="GT masks for SIP test set")
     p.add_argument('--output-dir', default=OUTPUT_DIR)
+    p.add_argument('--pretrained-dir', default=PRETRAINED_DIR,
+                   help="Directory for reusable pretrained checkpoints")
+    p.add_argument('--sam-checkpoint', default=None,
+                   help="Optional explicit SAM checkpoint path; otherwise uses --pretrained-dir/sam_vit_b.pth")
+    p.add_argument('--benchmark-root', default=os.path.join(BASE_DIR, 'Datasets'),
+                   help="Root containing ECSSD, DUT-O, DUTS_Dataset, and NPY benchmark files")
+    p.add_argument('--eval-benchmarks', nargs='*', default=None,
+                   help="Evaluate benchmark datasets by name after loading a checkpoint. Use ALL for ECSSD,DUT-O,DUTS-TE,HKU-IS,PASCAL-S.")
+    p.add_argument('--no-calibrate', action='store_true',
+                   help="Use --threshold directly instead of validation threshold calibration")
+    p.add_argument('--skip-default-eval', action='store_true',
+                   help="Skip the configured validation/test dirs and only run requested benchmark evaluation")
     # Training
     p.add_argument('--epochs',       type=int,   default=60)
     p.add_argument('--warmup-ep',    type=int,   default=5)
@@ -1925,6 +2460,8 @@ def parse_args():
                    help="Number of ESC blocks (paper uses N=4)")
     p.add_argument('--num-prompts',  type=int,   default=5)
     p.add_argument('--threshold',    type=float, default=0.5)
+    p.add_argument('--mse-lambda',  type=float, default=0.1,
+                   help="Lambda weight for the MSE term in the segmentation objective")
     p.add_argument('--train-with-val-data', action='store_true',
                    help="Research-only: append the dedicated validation split to the training loader. Validation is still evaluated/calibrated after training, so reported validation metrics are no longer held-out.")
     # Misc
@@ -1942,6 +2479,10 @@ def parse_args():
                    help="After main evaluation, sweep all candidate thresholds "
                         "on the test set and save per-threshold Dice/IoU to "
                         "threshold_sweep_test.csv.  Requires test GT masks.")
+    p.add_argument('--device', default='auto',
+                   help="Device to use: auto, cuda, cuda:N, or cpu (default: auto)")
+    p.add_argument('--allow-cpu', action='store_true',
+                   help="Allow CPU execution when CUDA is unavailable or --device cpu is used")
     # LR milestones
     p.add_argument('--milestones', nargs='+', type=float, default=[0.5, 0.75],
                    metavar='F',
@@ -1956,7 +2497,7 @@ def parse_args():
 
 def main():
     args   = parse_args()
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    device = resolve_device(args)
     print(f"[INFO] Device : {device}")
     os.makedirs(args.output_dir, exist_ok=True)
 
@@ -1973,7 +2514,7 @@ def main():
     tokenizer = open_clip.get_tokenizer('ViT-B-16')
 
     # ── SAM ViT-B  ────────────────────────────────────────────────────────────
-    sam_ckpt = os.path.join(args.output_dir, 'sam_vit_b.pth')
+    sam_ckpt = args.sam_checkpoint or os.path.join(args.pretrained_dir, 'sam_vit_b.pth')
     download_sam_checkpoint(sam_ckpt)
     print("[INFO] Loading SAM ViT-B …")
     sam = sam_model_registry['vit_b'](checkpoint=sam_ckpt).to(device)
@@ -2023,18 +2564,19 @@ def main():
             print(f"[INFO] Loaded captions.json ({len(captions)} entries)")
 
         # ── Dataset & loader ─────────────────────────────────────────────────
-        train_ds = ISICDataset(args.img_path, args.mask_path, captions,
+        train_ds = SalientObjectDataset(args.img_path, args.mask_path, captions,
                                augment=True)
         if args.train_with_val_data:
-            val_train_ds = ISICDataset(args.val_img, args.val_mask, {},
+            val_train_ds = SalientObjectDataset(args.val_img, args.val_mask, {},
                                        augment=True)
             train_ds = ConcatDataset([train_ds, val_train_ds])
             print("[WARN] Research mode enabled: validation split appended to "
                   "training data. Validation metrics/threshold calibration "
                   "are no longer held-out.")
             print(f"[INFO] Combined train samples: {len(train_ds)}")
+        pin_memory = torch.device(device).type == 'cuda'
         train_dl = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
-                              num_workers=args.num_workers, pin_memory=True,
+                              num_workers=args.num_workers, pin_memory=pin_memory,
                               drop_last=True)
 
         # ── Optimiser (dual LR) + scheduler ──────────────────────────────────
@@ -2067,7 +2609,8 @@ def main():
             epochs=args.epochs,
             save_path=best_path,
             pp_loss_weight=0.3, ds_weight=0.3,
-            threshold=args.threshold)
+            threshold=args.threshold,
+            mse_lambda=args.mse_lambda)
 
         save_training_plots(history, args.output_dir)
 
@@ -2081,59 +2624,72 @@ def main():
     #  SHARED EVALUATION  (both training and test-only paths)
     # ═════════════════════════════════════════════════════════════════════════
 
+    val_results = None
+    test_results = None
+    has_test_imgs = False
+
     # ── Calibrate threshold on validation set ────────────────────────────────
     # Run inference once on val, sweep candidate thresholds, pick the best one.
     # This threshold is then reused on the test set — never tuned on test data.
-    cal_thresh, _cal_dice = calibrate_threshold(
-        model, args.val_img, args.val_mask, device, use_tta=use_tta)
-
-    # ── Validation evaluation (with calibrated threshold) ────────────────────
-    val_dice, val_iou = evaluate_loop(
-        model, args.val_img, args.val_mask, device,
-        threshold=cal_thresh, split_name="Validation",
-        use_postprocess=True, use_tta=use_tta)
-    val_results = {'dice': val_dice, 'iou': val_iou}
-
-    # ── Test evaluation (GT available for ISIC-2017) ──────────────────────────
-    test_results   = None
-    has_test_imgs  = os.path.isdir(args.test_img)  and bool(os.listdir(args.test_img))
-    has_test_masks = os.path.isdir(args.test_mask) and bool(os.listdir(args.test_mask))
-
-    if has_test_imgs and has_test_masks:
-        test_dice, test_iou = evaluate_loop(
-            model, args.test_img, args.test_mask, device,
-            threshold=cal_thresh, split_name="Test",
-            use_postprocess=True, use_tta=use_tta)
-        test_results = {'dice': test_dice, 'iou': test_iou}
-
-        # ── Optional threshold sweep on test set ──────────────────────────
-        if args.threshold_sweep:
-            sweep_rows = threshold_sweep(
-                model, args.test_img, args.test_mask, device,
-                use_tta=use_tta, highlight_thresh=cal_thresh,
-                split_name="Test")
-            if sweep_rows:
-                sweep_csv = os.path.join(args.output_dir,
-                                         'threshold_sweep_test.csv')
-                _fields = ['threshold', 'mean_dice', 'std_dice',
-                           'best_dice', 'mean_iou', 'std_iou']
-                with open(sweep_csv, 'w', newline='') as _f:
-                    w = csv.DictWriter(_f, fieldnames=_fields)
-                    w.writeheader()
-                    w.writerows(sweep_rows)
-                print(f"[INFO] Threshold sweep saved → {sweep_csv}")
-
-        test_loop(model, args.test_img,
-                  os.path.join(args.output_dir, 'test_outputs'),
-                  device, masks_dir=args.test_mask, threshold=cal_thresh)
-    elif has_test_imgs:
-        print(f"\n[INFO] Test GT not found at {args.test_mask} — "
-              "generating visual outputs only (no metrics)")
-        test_loop(model, args.test_img,
-                  os.path.join(args.output_dir, 'test_outputs'),
-                  device, threshold=cal_thresh)
+    if args.no_calibrate:
+        cal_thresh = float(args.threshold)
+        print(f"[INFO] Threshold calibration disabled; using --threshold={cal_thresh:.2f}")
     else:
-        print(f"\n[INFO] Test images not found at {args.test_img} — skipping test")
+        cal_thresh, _cal_dice = calibrate_threshold(
+            model, args.val_img, args.val_mask, device, use_tta=use_tta)
+
+    if not args.skip_default_eval:
+        # ── Validation evaluation (with calibrated threshold) ────────────────────
+        val_results = evaluate_loop(
+            model, args.val_img, args.val_mask, device,
+            threshold=cal_thresh, split_name="Validation",
+            use_postprocess=True, use_tta=use_tta, output_dir=args.output_dir)
+
+        # ── Test evaluation (GT available for SIP) ──────────────────────────
+        test_results   = None
+        has_test_imgs  = os.path.isdir(args.test_img)  and bool(os.listdir(args.test_img))
+        has_test_masks = os.path.isdir(args.test_mask) and bool(os.listdir(args.test_mask))
+
+        if has_test_imgs and has_test_masks:
+            test_results = evaluate_loop(
+                model, args.test_img, args.test_mask, device,
+                threshold=cal_thresh, split_name="Test",
+                use_postprocess=True, use_tta=use_tta, output_dir=args.output_dir)
+
+            # ── Optional threshold sweep on test set ──────────────────────────
+            if args.threshold_sweep:
+                sweep_rows = threshold_sweep(
+                    model, args.test_img, args.test_mask, device,
+                    use_tta=use_tta, highlight_thresh=cal_thresh,
+                    split_name="Test")
+                if sweep_rows:
+                    sweep_csv = os.path.join(args.output_dir,
+                                             'threshold_sweep_test.csv')
+                    _fields = ['threshold', 'mean_dice', 'std_dice',
+                               'best_dice', 'mean_iou', 'std_iou']
+                    with open(sweep_csv, 'w', newline='') as _f:
+                        w = csv.DictWriter(_f, fieldnames=_fields)
+                        w.writeheader()
+                        w.writerows(sweep_rows)
+                    print(f"[INFO] Threshold sweep saved → {sweep_csv}")
+
+            test_loop(model, args.test_img,
+                      os.path.join(args.output_dir, 'test_outputs'),
+                      device, masks_dir=args.test_mask, threshold=cal_thresh)
+        elif has_test_imgs:
+            print(f"\n[INFO] Test GT not found at {args.test_mask} — "
+                  "generating visual outputs only (no metrics)")
+            test_loop(model, args.test_img,
+                      os.path.join(args.output_dir, 'test_outputs'),
+                      device, threshold=cal_thresh)
+        else:
+            print(f"\n[INFO] Test images not found at {args.test_img} — skipping test")
+
+    else:
+        print("[INFO] Skipping configured validation/test evaluation (--skip-default-eval)")
+
+    if args.eval_benchmarks:
+        evaluate_benchmark_suite(model, args, device, cal_thresh, use_tta=use_tta)
 
     # ── Save results YAML ─────────────────────────────────────────────────────
     save_results_yaml(history, val_results, test_results,
@@ -2148,7 +2704,8 @@ def main():
         print("  escnet_clean.pth       — last zero-NaN checkpoint")
         print("  training_curves.png    — loss / Dice / IoU plots")
         print("  training_diagnostics.csv")
-    print(f"  threshold used         — {cal_thresh:.2f} (calibrated on val set)")
+    threshold_note = 'fixed --threshold' if args.no_calibrate else 'calibrated on val set'
+    print(f"  threshold used         — {cal_thresh:.2f} ({threshold_note})")
     print("  results.yaml           — val & test metrics + threshold info")
     if has_test_imgs:
         print("  test_outputs/          — side-by-side visualisations")
