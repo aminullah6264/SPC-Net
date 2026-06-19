@@ -152,9 +152,9 @@ python clipsam.py \
   --threshold 0.5
 ```
 
-`--eval-benchmarks ALL` expands to `ECSSD`, `DUT-O`, `DUTS-TE`, `HKU-IS`, and `PASCAL-S`. The loader supports directory datasets such as `ECSSD/images` + `ECSSD/ground_truth_mask`, `DUT-O/DUT-OMRON-image` + `DUT-O/pixelwiseGT-new-PNG`, common DUTS-TE layouts, and NPY/ZIP NPY benchmark files such as `pascals_test_images.npy`, `pascals_test_masks.npy`, `pascal-s-npy.zip`, and `HKU-IS-npy.zip`.
+`--eval-benchmarks ALL` expands to `ECSSD`, `DUT-O`, `DUTS-TE`, `HKU-IS`, and `PASCAL-S`. The loader supports directory datasets such as `ECSSD/images` + `ECSSD/ground_truth_mask`, `DUT-O/DUT-OMRON-image` + `DUT-O/pixelwiseGT-new-PNG`, common DUTS-TE layouts, and flattened NPY benchmark files such as `HKU-IS/images.npy`, `HKU-IS/gt.npy`, `pascals/pascals_test_images.npy`, and `pascals/pascals_test_masks.npy`.
 
-Benchmark outputs include per-dataset `*_sip_metrics.csv` files and an aggregate `benchmark_sip_results.csv` containing E-Measure, S-Measure, Weighted-F, F-Measure, MAE, Dice, and IoU.
+Benchmark outputs include per-dataset `*_sip_metrics.csv` files, per-dataset `<dataset>_results.yaml` files, and an aggregate `benchmark_sip_results.csv` containing E-Measure, S-Measure, Weighted-F, F-Measure, MAE, Dice, and IoU.
 
 ## SIP evaluation outputs
 

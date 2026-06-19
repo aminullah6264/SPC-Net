@@ -36,8 +36,6 @@ import csv
 import json
 import argparse
 import math
-import zipfile
-import io
 import numpy as np
 import torch
 import torch.nn as nn
@@ -1847,14 +1845,39 @@ def evaluate_loop(model, images_dir, masks_dir, device,
 # ─────────────────────────────────────────────────────────────────────────────
 #  BENCHMARK EVALUATION (directory and NPY datasets)
 # ─────────────────────────────────────────────────────────────────────────────
-def _as_rgb_uint8(arr: np.ndarray) -> np.ndarray:
+def _reshape_flat_image(arr: np.ndarray) -> np.ndarray:
+    """Handle flattened benchmark NPY images such as (196608,) = 256*256*3."""
     arr = np.asarray(arr)
+    if arr.ndim == 1:
+        side3 = int(round(math.sqrt(arr.size / 3)))
+        if side3 * side3 * 3 == arr.size:
+            return arr.reshape(side3, side3, 3)
+        side = int(round(math.sqrt(arr.size)))
+        if side * side == arr.size:
+            return arr.reshape(side, side)
+    return arr
+
+
+def _reshape_flat_mask(arr: np.ndarray) -> np.ndarray:
+    """Handle flattened benchmark NPY masks such as (65536,) = 256*256."""
+    arr = np.asarray(arr)
+    if arr.ndim == 1:
+        side = int(round(math.sqrt(arr.size)))
+        if side * side == arr.size:
+            return arr.reshape(side, side)
+    return arr
+
+
+def _as_rgb_uint8(arr: np.ndarray) -> np.ndarray:
+    arr = _reshape_flat_image(np.asarray(arr))
     if arr.ndim == 2:
         arr = np.stack([arr] * 3, axis=-1)
     if arr.ndim == 3 and arr.shape[0] in (1, 3) and arr.shape[-1] not in (1, 3):
         arr = np.transpose(arr, (1, 2, 0))
     if arr.ndim == 3 and arr.shape[-1] == 1:
         arr = np.repeat(arr, 3, axis=-1)
+    if arr.ndim != 3 or arr.shape[-1] < 3:
+        raise ValueError(f"Cannot convert image array with shape {arr.shape} to RGB")
     if arr.dtype != np.uint8:
         arr = arr.astype(np.float32)
         if arr.max() <= 1.0:
@@ -1864,7 +1887,7 @@ def _as_rgb_uint8(arr: np.ndarray) -> np.ndarray:
 
 
 def _as_mask_float(arr: np.ndarray) -> np.ndarray:
-    arr = np.asarray(arr)
+    arr = _reshape_flat_mask(np.asarray(arr))
     if arr.ndim == 3:
         if arr.shape[-1] == 1:
             arr = arr[..., 0]
@@ -1872,6 +1895,8 @@ def _as_mask_float(arr: np.ndarray) -> np.ndarray:
             arr = arr[0]
         else:
             arr = arr[..., 0]
+    if arr.ndim != 2:
+        raise ValueError(f"Cannot convert mask array with shape {arr.shape} to HxW mask")
     arr = arr.astype(np.float32)
     if arr.max() > 1.0:
         arr = arr / 255.0
@@ -1903,37 +1928,6 @@ def _samples_from_npy(images_path: str, masks_path: str):
             for i in range(len(images))]
 
 
-def _load_npy_from_zip(zip_path: str, preferred: str):
-    if not os.path.exists(zip_path):
-        return None
-    with zipfile.ZipFile(zip_path) as zf:
-        npy_names = [n for n in zf.namelist() if n.lower().endswith('.npy')]
-        if not npy_names:
-            return None
-        preferred_names = [n for n in npy_names if preferred in os.path.basename(n).lower()]
-        name = preferred_names[0] if preferred_names else npy_names[0]
-        with zf.open(name) as f:
-            return np.load(io.BytesIO(f.read()), allow_pickle=True)
-
-
-def _samples_from_npy_zip(zip_path: str):
-    if not os.path.exists(zip_path):
-        return []
-    images = _load_npy_from_zip(zip_path, 'image')
-    masks = _load_npy_from_zip(zip_path, 'mask')
-    if masks is None:
-        masks = _load_npy_from_zip(zip_path, 'gt')
-    if masks is None:
-        masks = _load_npy_from_zip(zip_path, 'label')
-    if images is None or masks is None:
-        print(f"[WARN] Could not infer image/mask arrays from {zip_path}")
-        return []
-    if len(images) != len(masks):
-        raise ValueError(f"NPY zip image/mask count mismatch in {zip_path}: {len(images)} vs {len(masks)}")
-    return [(f"{i:05d}.png", _as_rgb_uint8(images[i]), _as_mask_float(masks[i]))
-            for i in range(len(images))]
-
-
 def load_benchmark_samples(root: str, name: str):
     key = name.lower().replace('_', '-').replace(' ', '-')
     if key == 'ecssd':
@@ -1943,11 +1937,13 @@ def load_benchmark_samples(root: str, name: str):
         return _samples_from_dirs(os.path.join(root, 'DUT-O', 'DUT-OMRON-image'),
                                   os.path.join(root, 'DUT-O', 'pixelwiseGT-new-PNG'))
     if key in ('pascal-s', 'pascals'):
-        return _samples_from_npy(os.path.join(root, 'pascals_test_images.npy'),
-                                 os.path.join(root, 'pascals_test_masks.npy')) or \
-               _samples_from_npy_zip(os.path.join(root, 'pascal-s-npy.zip'))
+        return (_samples_from_npy(os.path.join(root, 'pascals', 'pascals_test_images.npy'),
+                                  os.path.join(root, 'pascals', 'pascals_test_masks.npy')) or
+                _samples_from_npy(os.path.join(root, 'pascals_test_images.npy'),
+                                  os.path.join(root, 'pascals_test_masks.npy')))
     if key in ('hku-is', 'hkuis'):
-        return _samples_from_npy_zip(os.path.join(root, 'HKU-IS-npy.zip'))
+        return _samples_from_npy(os.path.join(root, 'HKU-IS', 'images.npy'),
+                                 os.path.join(root, 'HKU-IS', 'gt.npy'))
     if key in ('duts-te', 'duts'):
         candidates = [
             (os.path.join(root, 'DUTS_Dataset', 'DUTS-TE', 'DUTS-TE-Image'),
@@ -2038,7 +2034,7 @@ def evaluate_benchmark_suite(model, args, device, threshold, use_tta=True):
                                        output_dir=args.output_dir)
         if len(result['mae']) == 0:
             continue
-        summary.append({
+        row = {
             'dataset': name,
             'threshold': round(float(threshold), 4),
             'e_measure': round(float(result['e_measure'].mean()), 6),
@@ -2049,7 +2045,14 @@ def evaluate_benchmark_suite(model, args, device, threshold, use_tta=True):
             'dice': round(float(result['dice'].mean()), 6),
             'iou': round(float(result['iou'].mean()), 6),
             'n_samples': int(len(result['mae'])),
-        })
+        }
+        summary.append(row)
+
+        safe = name.lower().replace(' ', '_').replace('-', '_')
+        yaml_path = os.path.join(args.output_dir, f'{safe}_results.yaml')
+        with open(yaml_path, 'w') as f:
+            yaml.dump({'benchmark': row}, f, default_flow_style=False, sort_keys=False)
+        print(f"[INFO] Benchmark YAML saved → {yaml_path}")
     if summary:
         out_csv = os.path.join(args.output_dir, 'benchmark_sip_results.csv')
         fields = ['dataset', 'threshold', 'e_measure', 's_measure', 'weighted_f',
