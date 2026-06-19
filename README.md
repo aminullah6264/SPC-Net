@@ -136,6 +136,28 @@ python clipsam.py \
 If `--resume` is omitted, test-only mode looks for `escnet_best.pth` inside `--output-dir`.
 
 
+
+## Training from Pascal-S NPY files
+
+To train directly from flattened Pascal-S NPY arrays and evaluate the Pascal-S test NPY split afterward:
+
+```bash
+python clipsam.py \
+  --train-images-npy Datasets/pascals/pascals_train_images.npy \
+  --train-masks-npy Datasets/pascals/pascals_train_masks.npy \
+  --epochs 60 \
+  --batch-size 8 \
+  --num-workers 4 \
+  --mse-lambda 0.1 \
+  --output-dir outputs_clipSAM_MSE_PASCALS \
+  --eval-benchmarks PASCAL-S \
+  --skip-default-eval \
+  --no-calibrate \
+  --threshold 0.5
+```
+
+The NPY loader reshapes flattened RGB rows such as `(196608,)` into `256 × 256 × 3` images and flattened mask rows into square masks before augmentation/evaluation.
+
 ## Salient-object benchmark evaluation
 
 After training on DUTS-TR, evaluate the saved checkpoint on the common salient-object benchmarks with test-only mode:

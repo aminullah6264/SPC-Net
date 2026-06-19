@@ -1928,6 +1928,27 @@ def _samples_from_npy(images_path: str, masks_path: str):
             for i in range(len(images))]
 
 
+class NpySalientObjectDataset(Dataset):
+    """Training dataset for flattened or image-shaped NPY salient-object arrays."""
+    def __init__(self, images_path: str, masks_path: str, augment=False):
+        self.samples = _samples_from_npy(images_path, masks_path)
+        if not self.samples:
+            raise ValueError(f"No NPY samples loaded from {images_path} and {masks_path}")
+        self.transform = train_aug if augment else val_aug
+        print(f"[INFO] NPY dataset loaded: {len(self.samples)} samples from {images_path}")
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        fn, image_np, mask_np = self.samples[idx]
+        mask_u8 = (mask_np * 255.0).astype(np.uint8)
+        out = self.transform(image=image_np, mask=mask_u8)
+        img_t = out['image'].float()
+        mask_t = (out['mask'].float() / 255.0).unsqueeze(0)
+        return img_t, CAPTION, mask_t, fn
+
+
 def load_benchmark_samples(root: str, name: str):
     key = name.lower().replace('_', '-').replace(' ', '-')
     if key == 'ecssd':
@@ -2427,6 +2448,10 @@ def parse_args():
     # Paths
     p.add_argument('--img-path',   default=IMG_PATH)
     p.add_argument('--mask-path',  default=MASK_PATH)
+    p.add_argument('--train-images-npy', default=None,
+                   help="Optional NPY training images; overrides --img-path/--mask-path when paired with --train-masks-npy")
+    p.add_argument('--train-masks-npy', default=None,
+                   help="Optional NPY training masks paired with --train-images-npy")
     p.add_argument('--val-img',    default=VALIDATION_IMAGES_PATH)
     p.add_argument('--val-mask',   default=VALIDATION_MASK_PATH)
     p.add_argument('--test-img',   default=TEST_IMAGES_PATH)
@@ -2557,26 +2582,34 @@ def main():
     #  FULL TRAINING PATH
     # ═════════════════════════════════════════════════════════════════════════
     else:
-        # ── Captions ─────────────────────────────────────────────────────────
-        captions_path = os.path.join(args.img_path, 'captions.json')
-        if not os.path.exists(captions_path):
-            captions = generate_captions(args.img_path, CAPTION, captions_path)
-        else:
-            with open(captions_path) as f:
-                captions = json.load(f)
-            print(f"[INFO] Loaded captions.json ({len(captions)} entries)")
-
         # ── Dataset & loader ─────────────────────────────────────────────────
-        train_ds = SalientObjectDataset(args.img_path, args.mask_path, captions,
-                               augment=True)
-        if args.train_with_val_data:
-            val_train_ds = SalientObjectDataset(args.val_img, args.val_mask, {},
-                                       augment=True)
-            train_ds = ConcatDataset([train_ds, val_train_ds])
-            print("[WARN] Research mode enabled: validation split appended to "
-                  "training data. Validation metrics/threshold calibration "
-                  "are no longer held-out.")
-            print(f"[INFO] Combined train samples: {len(train_ds)}")
+        if args.train_images_npy or args.train_masks_npy:
+            if not (args.train_images_npy and args.train_masks_npy):
+                raise ValueError("Both --train-images-npy and --train-masks-npy are required for NPY training")
+            train_ds = NpySalientObjectDataset(args.train_images_npy,
+                                               args.train_masks_npy,
+                                               augment=True)
+            if args.train_with_val_data:
+                print("[WARN] --train-with-val-data is ignored for NPY training.")
+        else:
+            captions_path = os.path.join(args.img_path, 'captions.json')
+            if not os.path.exists(captions_path):
+                captions = generate_captions(args.img_path, CAPTION, captions_path)
+            else:
+                with open(captions_path) as f:
+                    captions = json.load(f)
+                print(f"[INFO] Loaded captions.json ({len(captions)} entries)")
+
+            train_ds = SalientObjectDataset(args.img_path, args.mask_path, captions,
+                                            augment=True)
+            if args.train_with_val_data:
+                val_train_ds = SalientObjectDataset(args.val_img, args.val_mask, {},
+                                                    augment=True)
+                train_ds = ConcatDataset([train_ds, val_train_ds])
+                print("[WARN] Research mode enabled: validation split appended to "
+                      "training data. Validation metrics/threshold calibration "
+                      "are no longer held-out.")
+                print(f"[INFO] Combined train samples: {len(train_ds)}")
         pin_memory = torch.device(device).type == 'cuda'
         train_dl = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
                               num_workers=args.num_workers, pin_memory=pin_memory,
