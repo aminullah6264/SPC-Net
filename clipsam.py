@@ -60,7 +60,7 @@ from typing import Optional
 #  PATHS  (local server — extracted by setup_dataset.py)
 # ─────────────────────────────────────────────────────────────────────────────
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DATASET  = '/mnt/data/users/av543f/datasets/SIP_Dataset/'
+DATASET  = './Datasets/SIP_Dataset/'
 
 IMG_PATH               = os.path.join(DATASET, 'Train/Images')
 MASK_PATH              = os.path.join(DATASET, 'Train/Masks')
@@ -69,6 +69,19 @@ VALIDATION_MASK_PATH   = os.path.join(DATASET, 'Test/Masks')
 TEST_IMAGES_PATH       = os.path.join(DATASET, 'Test1/Images')
 TEST_MASK_PATH         = os.path.join(DATASET, 'Test1/Masks')
 OUTPUT_DIR             = os.path.join(BASE_DIR, 'outputs_clipSAM')
+
+
+
+DATASET  = './Datasets/DUTS_Dataset/'
+
+IMG_PATH               = os.path.join(DATASET, 'DUTS-TR/DUTS-TR-Image')
+MASK_PATH              = os.path.join(DATASET, 'DUTS-TR/DUTS-TR-Mask')
+VALIDATION_IMAGES_PATH = os.path.join(DATASET, 'DUTS-TE/DUTS-TE-Image')
+VALIDATION_MASK_PATH   = os.path.join(DATASET, 'DUTS-TE/DUTS-TE-Mask')
+TEST_IMAGES_PATH       = os.path.join(DATASET, 'DUTS-TE/DUTS-TE-Image')
+TEST_MASK_PATH         = os.path.join(DATASET, 'DUTS-TE/DUTS-TE-Mask')
+OUTPUT_DIR             = os.path.join(BASE_DIR, 'outputs_clipSAM')
+
 
 # Salient-object caption (better CLIP alignment for SIP)
 CAPTION = "a photo of a salient object"

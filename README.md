@@ -84,7 +84,7 @@ CUDA_VISIBLE_DEVICES=0 python clipsam.py \
   --batch-size 8 \
   --num-workers 4 \
   --mse-lambda 0.1 \
-  --output-dir outputs_clipSAM_MSE
+  --output-dir outputs_clipSAM_MSE_DUTS
 ```
 
 Use `--allow-cpu` only for tiny smoke tests; full 213M-parameter training on CPU is not practical.
