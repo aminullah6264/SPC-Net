@@ -419,12 +419,13 @@ class PseudoPromptGenerator(nn.Module):
     (Paper §3.2  "Pseudo Prompt Generator")
     """
     def __init__(self, threshold=0.1, num_regions=5,
-                 top_fraction=0.15, min_pixels=None):
+                 top_fraction=0.15, min_pixels=None, adaptive_fallback=True):
         super().__init__()
         self.threshold    = threshold
         self.num_regions  = num_regions
         self.top_fraction = top_fraction  # fraction of map used as fallback floor
         self.min_pixels   = min_pixels    # explicit pixel floor (None → computed)
+        self.adaptive_fallback = adaptive_fallback
 
     def forward(self, corr_maps):
         # corr_maps: (B, H, W)
@@ -451,7 +452,7 @@ class PseudoPromptGenerator(nn.Module):
                        if self.min_pixels is not None
                        else max(self.num_regions * 4, int(self.top_fraction * H * W)))
 
-            if int(bin_mask.sum()) < min_pix:
+            if self.adaptive_fallback and int(bin_mask.sum()) < min_pix:
                 n_select = max(min_pix, int(self.top_fraction * H * W))
                 flat     = prob_np.ravel()
                 # argpartition is O(N) — faster than a full sort
@@ -460,9 +461,10 @@ class PseudoPromptGenerator(nn.Module):
                 bin_mask[topk_idx] = 1
                 bin_mask = bin_mask.reshape(H, W)
 
-            # coords is now GUARANTEED non-empty: softmax always has a positive
-            # maximum so top-K always selects something.
             coords     = np.column_stack(np.nonzero(bin_mask))
+            if len(coords) == 0:
+                # Naive threshold-only PPG: empty support emits zero prompts/masks.
+                continue
             n_clusters = min(P, len(coords))
             km = KMeans(n_clusters=n_clusters, n_init=10, random_state=0).fit(coords)
 
@@ -489,13 +491,15 @@ class PseudoPromptGenerator(nn.Module):
 #  weight layout exactly.
 # ─────────────────────────────────────────────────────────────────────────────
 class SAMBlock(nn.Module):
-    def __init__(self, sam_decoder_block, prompt_encoder, feature_dim, num_prompts):
+    def __init__(self, sam_decoder_block, prompt_encoder, feature_dim, num_prompts,
+                 bidirectional=True):
         super().__init__()
         self.decoder_block  = sam_decoder_block
         self.prompt_encoder = prompt_encoder
         sam_dim             = sam_decoder_block.self_attn.q_proj.in_features
         self.sam_dim        = sam_dim
         self.num_prompts    = num_prompts
+        self.bidirectional = bidirectional
         # Project CLIP features → SAM embedding dim
         self.proj  = nn.Conv2d(feature_dim, sam_dim, kernel_size=1)
         # Fuse per-prompt outputs back to feature_dim
@@ -537,8 +541,11 @@ class SAMBlock(nn.Module):
 
             # 2) Token-to-image cross-attention  (prompt queries, image K/V)
             #    Prompts gather spatial context from image features
-            pt_t2i = self.decoder_block.cross_attn_token_to_image(
-                pt_sa, img_tokens, img_tokens)                         # (B, T, sam_dim)
+            if self.bidirectional:
+                pt_t2i = self.decoder_block.cross_attn_token_to_image(
+                    pt_sa, img_tokens, img_tokens)                     # (B, T, sam_dim)
+            else:
+                pt_t2i = pt_sa
 
             # 3) Image-to-token cross-attention  (image queries, prompt K/V)
             #    Image features are refined by prompt information
@@ -620,11 +627,14 @@ class VLFBlock(nn.Module):
 # ─────────────────────────────────────────────────────────────────────────────
 class ESCBlock(nn.Module):
     def __init__(self, sam_dec_block, prompt_encoder,
-                 feature_dim, num_prompts, text_dim):
+                 feature_dim, num_prompts, text_dim,
+                 adaptive_fallback=True, bidirectional_sam=True):
         super().__init__()
-        self.ppg       = PseudoPromptGenerator(num_regions=num_prompts)
+        self.ppg       = PseudoPromptGenerator(num_regions=num_prompts,
+                                               adaptive_fallback=adaptive_fallback)
         self.sam_block = SAMBlock(sam_dec_block, prompt_encoder,
-                                  feature_dim, num_prompts)
+                                  feature_dim, num_prompts,
+                                  bidirectional=bidirectional_sam)
         self.vlf       = VLFBlock(feature_dim, text_dim)
 
     def forward(self, feat_maps, text_embeds, corr_maps):
@@ -736,6 +746,38 @@ class MaskDecoder(nn.Module):
 
         return self.final(x), ds2_logits, ds3_logits
 
+
+class SimpleMaskDecoder(nn.Module):
+    """
+    Plain U-Net-style decoder for ablations.
+
+    Uses bilinear upsampling and CLIP skip connections only.  It intentionally
+    omits ASPP, correlation injection, and deep-supervision heads.
+    """
+    def __init__(self, feature_dim, skips_dims, corr_ch=2, dropout=0.2):
+        super().__init__()
+        c1, c2, c3 = skips_dims
+        self.lat3 = nn.Conv2d(c3, feature_dim, 1)
+        self.lat2 = nn.Conv2d(c2, feature_dim // 2, 1)
+        self.lat1 = nn.Conv2d(c1, feature_dim // 4, 1)
+        self.up1 = MaskDecoder._up_block(feature_dim, feature_dim // 2)
+        self.up2 = MaskDecoder._up_block(feature_dim // 2, feature_dim // 4)
+        self.up3 = MaskDecoder._up_block(feature_dim // 4, feature_dim // 8)
+        self.drop = nn.Dropout2d(p=dropout)
+        self.final = nn.Sequential(
+            nn.Conv2d(feature_dim // 8, feature_dim // 8, 3, padding=1),
+            nn.BatchNorm2d(feature_dim // 8), nn.ReLU(inplace=True),
+            nn.Conv2d(feature_dim // 8, 1, 1))
+
+    def forward(self, x, skips, corr_maps):
+        x = self.up1(x + F.interpolate(self.lat3(skips[2]), size=x.shape[-2:],
+                                        mode='bilinear', align_corners=False))
+        x = self.up2(x + F.interpolate(self.lat2(skips[1]), size=x.shape[-2:],
+                                        mode='bilinear', align_corners=False))
+        x = self.up3(x + F.interpolate(self.lat1(skips[0]), size=x.shape[-2:],
+                                        mode='bilinear', align_corners=False))
+        return self.final(self.drop(x)), None, None
+
 # ─────────────────────────────────────────────────────────────────────────────
 #  ESCNet  (main model)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -753,7 +795,9 @@ class ESCNet(nn.Module):
     HOOK_INDICES  = [2, 5, 8, 11]   # transformer block indices (0-based)
 
     def __init__(self, clip_model, sam_model,
-                 num_blocks=4, num_prompts=5):
+                 num_blocks=4, num_prompts=5,
+                 adaptive_fallback=True, bidirectional_sam=True,
+                 simple_decoder=False):
         super().__init__()
 
         # ── CLIP visual encoder ───────────────────────────────────────────────
@@ -809,12 +853,15 @@ class ESCNet(nn.Module):
 
         self.esc_blocks = nn.ModuleList([
             ESCBlock(dec_blocks[i], sam_model.prompt_encoder,
-                     self.VIT_FEAT_DIM, num_prompts, text_dim)
+                     self.VIT_FEAT_DIM, num_prompts, text_dim,
+                     adaptive_fallback=adaptive_fallback,
+                     bidirectional_sam=bidirectional_sam)
             for i in range(num_blocks)
         ])
 
-        # ── FPN decoder  (all ViT skip dims = 768) ────────────────────────────
-        self.mask_decoder = MaskDecoder(
+        # ── Decoder  (all ViT skip dims = 768) ─────────────────────────────────
+        decoder_cls = SimpleMaskDecoder if simple_decoder else MaskDecoder
+        self.mask_decoder = decoder_cls(
             feature_dim = self.VIT_FEAT_DIM,
             skips_dims  = [self.VIT_FEAT_DIM,
                            self.VIT_FEAT_DIM,
@@ -1359,7 +1406,7 @@ class WarmupCosineScheduler(torch.optim.lr_scheduler._LRScheduler):
 # ─────────────────────────────────────────────────────────────────────────────
 def train_loop(model, dataloader, optimizer, scheduler, device, epochs,
                save_path, pp_loss_weight=0.3, ds_weight=0.3, threshold=0.5,
-               mse_lambda=0.1):
+               mse_lambda=0.1, plain_bce_loss=False):
     """
     Training loop with:
       • Per-batch NaN/Inf loss guard (skips weight update, logs breakdown)
@@ -1368,8 +1415,9 @@ def train_loop(model, dataloader, optimizer, scheduler, device, epochs,
       • AMP scale-drop counter (each drop = GradScaler detected overflow)
       • CSV diagnostics file for post-hoc analysis
     """
-    criterion  = CompoundLoss(w_tversky=0.6, w_focal=0.4, mse_lambda=mse_lambda,
-                              gamma=2.0, tversky_alpha=0.7, tversky_beta=0.3)
+    criterion  = (nn.BCEWithLogitsLoss() if plain_bce_loss else
+                  CompoundLoss(w_tversky=0.6, w_focal=0.4, mse_lambda=mse_lambda,
+                               gamma=2.0, tversky_alpha=0.7, tversky_beta=0.3))
     # init_scale=4096: the default (65536) dropped 4× in epoch 1 every run,
     # so pre-set it to the stable value.  growth_interval=2000 avoids
     # re-growing aggressively and triggering new overflows.
@@ -1454,7 +1502,11 @@ def train_loop(model, dataloader, optimizer, scheduler, device, epochs,
                                         mode='bilinear', align_corners=False)
 
                 # Main loss — get component scalars at no extra compute cost
-                loss, _stats = criterion.forward_with_stats(preds_r, masks)
+                if plain_bce_loss:
+                    loss = criterion(preds_r, masks)
+                    _stats = {'tversky': 0.0, 'focal': loss.detach().item(), 'mse': 0.0}
+                else:
+                    loss, _stats = criterion.forward_with_stats(preds_r, masks)
 
                 for ds_key in ('ds2', 'ds3'):
                     if aux.get(ds_key) is not None:
@@ -2440,6 +2492,16 @@ def resolve_device(args) -> str:
 
     raise ValueError(f"Unsupported --device value: {args.device!r}. Use auto, cpu, cuda, or cuda:N.")
 
+
+def set_seed(seed: int):
+    """Seed Python, NumPy, and PyTorch for repeatable ablation runs."""
+    import random
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
 # ─────────────────────────────────────────────────────────────────────────────
 #  MAIN
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2503,6 +2565,20 @@ def parse_args():
                    help="Disable test-time augmentation during evaluation")
     p.add_argument('--no-prompt-bank', action='store_true',
                    help="Disable multi-prompt bank (use single caption only)")
+    p.add_argument('--no-adaptive-fallback', action='store_true',
+                   help="Disable PPG top-rho fallback; use threshold-only prompts")
+    p.add_argument('--no-bidirectional-sam', action='store_true',
+                   help="Disable token-to-image SAM attention; use image-to-token only")
+    p.add_argument('--simple-decoder', action='store_true',
+                   help="Use plain U-Net-style decoder without ASPP/correlation/deep supervision")
+    p.add_argument('--plain-bce-loss', action='store_true',
+                   help="Use BCEWithLogitsLoss instead of the compound SOD loss")
+    p.add_argument('--pp-loss-weight', type=float, default=0.3,
+                   help="Point-classification auxiliary loss weight (0 disables it)")
+    p.add_argument('--ds-weight', type=float, default=0.3,
+                   help="Deep-supervision loss weight (0 disables it)")
+    p.add_argument('--seed', type=int, default=0,
+                   help="Random seed for reproducible runs")
     p.add_argument('--threshold-sweep', action='store_true',
                    help="After main evaluation, sweep all candidate thresholds "
                         "on the test set and save per-threshold Dice/IoU to "
@@ -2525,6 +2601,7 @@ def parse_args():
 
 def main():
     args   = parse_args()
+    set_seed(args.seed)
     device = resolve_device(args)
     print(f"[INFO] Device : {device}")
     os.makedirs(args.output_dir, exist_ok=True)
@@ -2550,7 +2627,10 @@ def main():
     # ── Model  ────────────────────────────────────────────────────────────────
     model = ESCNet(clip_model, sam,
                    num_blocks=args.num_blocks,
-                   num_prompts=args.num_prompts).to(device)
+                   num_prompts=args.num_prompts,
+                   adaptive_fallback=not args.no_adaptive_fallback,
+                   bidirectional_sam=not args.no_bidirectional_sam,
+                   simple_decoder=args.simple_decoder).to(device)
 
     if not args.no_prompt_bank:
         model.setup_prompt_bank(tokenizer, device)
@@ -2644,9 +2724,10 @@ def main():
             model, train_dl, optimizer, scheduler, device,
             epochs=args.epochs,
             save_path=best_path,
-            pp_loss_weight=0.3, ds_weight=0.3,
+            pp_loss_weight=args.pp_loss_weight, ds_weight=args.ds_weight,
             threshold=args.threshold,
-            mse_lambda=args.mse_lambda)
+            mse_lambda=args.mse_lambda,
+            plain_bce_loss=args.plain_bce_loss)
 
         save_training_plots(history, args.output_dir)
 

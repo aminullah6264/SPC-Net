@@ -213,3 +213,28 @@ python clipsam.py \
 ```
 
 This writes `threshold_sweep_test.csv`. The SIP metrics in `sip_results.csv` still use the validation-calibrated threshold, not a test-tuned threshold.
+
+## SIP ablation harness
+
+Run the cumulative SPC-Net ablation sequence on SIP with a shared seed and shared
+training hyperparameters:
+
+```bash
+python run_ablation.py --epochs <N> --seed 0 -- \
+  --img-path /path/to/SIP/Train/Images \
+  --mask-path /path/to/SIP/Train/Masks \
+  --val-img /path/to/SIP/Val/Images \
+  --val-mask /path/to/SIP/Val/Masks \
+  --test-img /path/to/SIP/Test/Images \
+  --test-mask /path/to/SIP/Test/Masks
+```
+
+The driver trains each variant from scratch, calibrates the threshold on the
+validation split, evaluates the SIP test split, and writes:
+
+- `outputs_clipSAM/ablation_sip.csv` with `variant`, SIP metrics, and flags.
+- `outputs_clipSAM/ablation_sip.tex` with a LaTeX tabular body ready to paste
+  into the paper.
+
+Use `python run_ablation.py --smoke` to verify output formatting without running
+training.
