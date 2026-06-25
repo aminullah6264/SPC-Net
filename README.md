@@ -220,13 +220,13 @@ Run the cumulative SPC-Net ablation sequence on SIP with a shared seed and share
 training hyperparameters:
 
 ```bash
-python run_ablation.py --epochs <N> --seed 0 -- \
-  --img-path /path/to/SIP/Train/Images \
-  --mask-path /path/to/SIP/Train/Masks \
-  --val-img /path/to/SIP/Val/Images \
-  --val-mask /path/to/SIP/Val/Masks \
-  --test-img /path/to/SIP/Test/Images \
-  --test-mask /path/to/SIP/Test/Masks
+python run_ablation.py --epochs 60 --seed 0 -- \
+  --img-path ./Datasets/SIP_Dataset/Train/Images \
+  --mask-path ./Datasets/SIP_Dataset/Train/Masks \
+  --val-img ./Datasets/SIP_Dataset/Val/Images \
+  --val-mask ./Datasets/SIP_Dataset/Val/Masks \
+  --test-img ./Datasets/SIP_Dataset/Test/Images \
+  --test-mask ./Datasets/SIP_Dataset/Test/Masks
 ```
 
 The driver trains each variant from scratch, calibrates the threshold on the
@@ -238,3 +238,12 @@ validation split, evaluates the SIP test split, and writes:
 
 Use `python run_ablation.py --smoke` to verify output formatting without running
 training.
+
+
+python run_ablation.py --epochs 30 --seed 0 -- \
+  --img-path ./Datasets/SIP_Dataset/Train/Images \
+  --mask-path ./Datasets/SIP_Dataset/Train/Masks \
+  --val-img ./Datasets/SIP_Dataset/Test/Images \
+  --val-mask ./Datasets/SIP_Dataset/Test/Masks \
+  --test-img ./Datasets/SIP_Dataset/Test/Images \
+  --test-mask ./Datasets/SIP_Dataset/Test/Masks
