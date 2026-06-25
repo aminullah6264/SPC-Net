@@ -74,6 +74,22 @@ PRETRAINED_DIR         = os.path.join(BASE_DIR, 'pretrained_models')
 # Salient-object caption (better CLIP alignment for SIP)
 CAPTION = "a photo of a salient object"
 
+
+def _safe_split_dirname(split_name: str) -> str:
+    """Return a filesystem-safe split/dataset name for output folders."""
+    safe = (split_name or 'split').strip().lower().replace(' ', '_').replace('-', '_')
+    return safe or 'split'
+
+
+def _save_predicted_mask(mask_bin: np.ndarray, output_dir: str, filename: str) -> str:
+    """Save a binary predicted mask as an 8-bit PNG and return its path."""
+    os.makedirs(output_dir, exist_ok=True)
+    stem = os.path.splitext(os.path.basename(filename))[0]
+    out_path = os.path.join(output_dir, stem + '.png')
+    mask_u8 = (np.asarray(mask_bin).astype(np.uint8) * 255)
+    Image.fromarray(mask_u8, mode='L').save(out_path)
+    return out_path
+
 # ── Multi-prompt bank ─────────────────────────────────────────────────────────
 # Diverse textual descriptions of salient objects.  Each prompt is encoded
 # independently by the CLIP text encoder; their cosine-similarity maps with
@@ -1793,7 +1809,7 @@ def threshold_sweep(model, images_dir, masks_dir, device,
 
 def evaluate_loop(model, images_dir, masks_dir, device,
                   threshold=0.5, split_name="", use_postprocess=True,
-                  use_tta=True, output_dir=None):
+                  use_tta=True, output_dir=None, save_pred_masks=True):
     model.eval()
     dice_list, iou_list, missing = [], [], 0
     sip_metrics = {
@@ -1801,6 +1817,10 @@ def evaluate_loop(model, images_dir, masks_dir, device,
         'f_measure': [], 'mae': []
     }
     per_image_rows = []
+    pred_mask_dir = None
+    if output_dir is not None and save_pred_masks:
+        pred_mask_dir = os.path.join(output_dir, 'predicted_masks',
+                                     _safe_split_dirname(split_name))
 
     image_files = sorted([f for f in os.listdir(images_dir)
                            if f.lower().endswith(IMAGE_EXTENSIONS)])
@@ -1833,6 +1853,8 @@ def evaluate_loop(model, images_dir, masks_dir, device,
                                   )[0, 0].cpu().numpy()
         pred_bin = (postprocess_mask(pred_np, threshold)
                     if use_postprocess else pred_np >= threshold)
+        if pred_mask_dir is not None:
+            _save_predicted_mask(pred_bin, pred_mask_dir, fn)
 
         dice = dice_score(pred_bin, gt_bin)
         iou  = iou_score(pred_bin, gt_bin)
@@ -1882,7 +1904,7 @@ def evaluate_loop(model, images_dir, masks_dir, device,
 
     if output_dir is not None and per_image_rows:
         os.makedirs(output_dir, exist_ok=True)
-        safe_split = (split_name or 'split').strip().lower().replace(' ', '_')
+        safe_split = _safe_split_dirname(split_name)
         metrics_csv = os.path.join(output_dir, f'{safe_split}_sip_metrics.csv')
         fields = ['filename', 'dice', 'iou', 'e_measure', 's_measure',
                   'weighted_f', 'f_measure', 'mae']
@@ -1891,6 +1913,8 @@ def evaluate_loop(model, images_dir, masks_dir, device,
             writer.writeheader()
             writer.writerows(per_image_rows)
         print(f"[INFO] Per-image SIP metrics saved → {metrics_csv}")
+    if pred_mask_dir is not None:
+        print(f"[INFO] Predicted masks saved → {pred_mask_dir}")
 
     return result
 
@@ -2034,11 +2058,16 @@ def load_benchmark_samples(root: str, name: str):
 
 
 def evaluate_samples_loop(model, samples, device, threshold=0.5, split_name='',
-                          use_postprocess=True, use_tta=True, output_dir=None):
+                          use_postprocess=True, use_tta=True, output_dir=None,
+                          save_pred_masks=True):
     model.eval()
     metrics = {'dice': [], 'iou': [], 'e_measure': [], 's_measure': [],
                'weighted_f': [], 'f_measure': [], 'mae': []}
     rows = []
+    pred_mask_dir = None
+    if output_dir is not None and save_pred_masks:
+        pred_mask_dir = os.path.join(output_dir, 'predicted_masks',
+                                     _safe_split_dirname(split_name))
     print(f"\n[INFO] Evaluating benchmark {split_name}"
           + (" (TTA)" if use_tta else "") + f" — {len(samples)} images")
     for fn, image_np, gt_np in samples:
@@ -2056,6 +2085,8 @@ def evaluate_samples_loop(model, samples, device, threshold=0.5, split_name='',
         pred_np = F.interpolate(pred_probs, size=gt_np.shape,
                                 mode='bilinear', align_corners=False)[0, 0].cpu().numpy()
         pred_bin = postprocess_mask(pred_np, threshold) if use_postprocess else pred_np >= threshold
+        if pred_mask_dir is not None:
+            _save_predicted_mask(pred_bin, pred_mask_dir, fn)
         sip = sip_metric_scores(pred_np, gt_bin, threshold=threshold)
         dice = dice_score(pred_bin, gt_bin)
         iou = iou_score(pred_bin, gt_bin)
@@ -2083,7 +2114,7 @@ def evaluate_samples_loop(model, samples, device, threshold=0.5, split_name='',
 
     if output_dir is not None:
         os.makedirs(output_dir, exist_ok=True)
-        safe = split_name.lower().replace(' ', '_').replace('-', '_')
+        safe = _safe_split_dirname(split_name)
         out_csv = os.path.join(output_dir, f'{safe}_sip_metrics.csv')
         fields = ['filename', 'dice', 'iou', 'e_measure', 's_measure',
                   'weighted_f', 'f_measure', 'mae']
@@ -2092,6 +2123,8 @@ def evaluate_samples_loop(model, samples, device, threshold=0.5, split_name='',
             writer.writeheader()
             writer.writerows(rows)
         print(f"[INFO] Benchmark per-image metrics saved → {out_csv}")
+    if pred_mask_dir is not None:
+        print(f"[INFO] Benchmark predicted masks saved → {pred_mask_dir}")
     return result
 
 
@@ -2160,14 +2193,14 @@ def _make_overlay(image_np: np.ndarray, mask_bin: np.ndarray,
 
 
 def test_loop(model, images_dir, output_dir, device,
-              masks_dir=None, threshold=0.5):
+              masks_dir=None, threshold=0.5, pred_mask_dir=None):
     """
     Save per-image visualisation panels for all images in `images_dir`.
 
     Layout when GT masks are available (masks_dir is set):
       ┌──────────────┬──────────────────┬──────────────────────────────┐
       │ Input image  │  GT overlay (⬜) │  Prediction overlay (🟥)     │
-      │              │  (green)         │  Dice=X.XXX  IoU=X.XXX       │
+      │              │  (green)         │                              │
       └──────────────┴──────────────────┴──────────────────────────────┘
 
     Layout without GT (masks_dir=None or mask not found):
@@ -2176,10 +2209,12 @@ def test_loop(model, images_dir, output_dir, device,
       └──────────────┴──────────────────────┘
 
     Overlays: green fill+border = GT, red fill+border = Prediction.
-    Per-image Dice / IoU are shown in the prediction panel title.
     Files are saved as <output_dir>/<stem>.png at 150 dpi.
+    If pred_mask_dir is set, binary predicted masks are saved there as PNGs.
     """
     os.makedirs(output_dir, exist_ok=True)
+    if pred_mask_dir is not None:
+        os.makedirs(pred_mask_dir, exist_ok=True)
     model.eval()
     image_files = sorted([f for f in os.listdir(images_dir)
                           if f.lower().endswith(IMAGE_EXTENSIONS)])
@@ -2199,6 +2234,8 @@ def test_loop(model, images_dir, output_dir, device,
                                    mode='bilinear', align_corners=False
                                    )[0, 0].cpu().numpy()
         pred_bin   = postprocess_mask(pred_np, threshold)         # bool H×W
+        if pred_mask_dir is not None:
+            _save_predicted_mask(pred_bin, pred_mask_dir, fn)
 
         # ── GT (optional) ─────────────────────────────────────────────────────
         gt_bin = None
@@ -2231,12 +2268,8 @@ def test_loop(model, images_dir, output_dir, device,
             axes[col].axis('off')
             col += 1
 
-        # Panel 3 — Prediction overlay (red) + per-image metrics
+        # Panel 3 — Prediction overlay (red)
         pred_title = 'Prediction'
-        if gt_bin is not None:
-            d = dice_score(pred_bin, gt_bin)
-            j = iou_score(pred_bin, gt_bin)
-            pred_title = f'Prediction    Dice {d:.3f}  ·  IoU {j:.3f}'
 
         axes[col].imshow(_make_overlay(image_np, pred_bin, (220, 60, 60)))
         axes[col].set_title(pred_title, color='#ff6b6b', fontsize=11, pad=5)
@@ -2251,6 +2284,8 @@ def test_loop(model, images_dir, output_dir, device,
         saved += 1
 
     print(f"[INFO] Saved {saved} visualisation panels → {output_dir}")
+    if pred_mask_dir is not None:
+        print(f"[INFO] Saved {saved} predicted masks → {pred_mask_dir}")
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  TRAINING CURVES PLOT
@@ -2792,13 +2827,17 @@ def main():
 
             test_loop(model, args.test_img,
                       os.path.join(args.output_dir, 'test_outputs'),
-                      device, masks_dir=args.test_mask, threshold=cal_thresh)
+                      device, masks_dir=args.test_mask, threshold=cal_thresh,
+                      pred_mask_dir=os.path.join(args.output_dir,
+                                                 'predicted_masks', 'test'))
         elif has_test_imgs:
             print(f"\n[INFO] Test GT not found at {args.test_mask} — "
                   "generating visual outputs only (no metrics)")
             test_loop(model, args.test_img,
                       os.path.join(args.output_dir, 'test_outputs'),
-                      device, threshold=cal_thresh)
+                      device, threshold=cal_thresh,
+                      pred_mask_dir=os.path.join(args.output_dir,
+                                                 'predicted_masks', 'test'))
         else:
             print(f"\n[INFO] Test images not found at {args.test_img} — skipping test")
 
@@ -2826,6 +2865,7 @@ def main():
     print("  results.yaml           — val & test metrics + threshold info")
     if has_test_imgs:
         print("  test_outputs/          — side-by-side visualisations")
+        print("  predicted_masks/test/  — binary predicted mask PNGs")
 
 
 if __name__ == '__main__':
