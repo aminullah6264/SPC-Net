@@ -95,10 +95,21 @@ BENCHMARK_REGISTRY = {
         'masks_npy': os.path.join(SOD_DATASET_ROOT, 'HKU-IS/gt.npy'),
         'type': 'npy',
     },
+    # DEPRECATED (2026-11): the 256-image NPY subset gave broken results
+    # (S-measure ~0.45, likely image/mask misalignment). Kept for records only.
+    # Use 'PASCAL-S-full' (850 images) for all reported numbers.
     'PASCAL-S': {
         'images_npy': os.path.join(SOD_DATASET_ROOT, 'pascals/pascals_test_images.npy'),
         'masks_npy': os.path.join(SOD_DATASET_ROOT, 'pascals/pascals_test_masks.npy'),
         'type': 'npy',
+    },
+    # Full PASCAL-S (850 images). Images (.jpg) and masks (.png) share one
+    # folder with matching stems, so only .jpg files are listed as images.
+    'PASCAL-S-full': {
+        'images': os.path.join(SOD_DATASET_ROOT, 'pascals-full/PASCALS'),
+        'masks': os.path.join(SOD_DATASET_ROOT, 'pascals-full/PASCALS'),
+        'type': 'directory',
+        'image_exts': ('.jpg', '.jpeg'),
     },
     'SIP': {
         'images': os.path.join(SOD_DATASET_ROOT, 'SIP_Dataset/Test/Images'),
@@ -2299,12 +2310,26 @@ def _as_mask_float(arr: np.ndarray) -> np.ndarray:
     return np.clip(arr, 0.0, 1.0)
 
 
-def _samples_from_dirs(images_dir: str, masks_dir: str):
+def _samples_from_dirs(images_dir: str, masks_dir: str, image_exts=None):
+    """Load (filename, image, mask) triples.
+
+    image_exts: optional tuple restricting which files count as images. Needed
+    when images and masks live in the same folder (PASCAL-S-full), where the
+    default IMAGE_EXTENSIONS would also pick up the .png masks.
+    """
     if not (os.path.isdir(images_dir) and os.path.isdir(masks_dir)):
         return []
+    exts = tuple(image_exts) if image_exts else IMAGE_EXTENSIONS
+    same_folder = os.path.abspath(images_dir) == os.path.abspath(masks_dir)
     samples = []
-    for fn in sorted(f for f in os.listdir(images_dir) if f.lower().endswith(IMAGE_EXTENSIONS)):
-        mask_path = find_mask_path(masks_dir, fn)
+    for fn in sorted(f for f in os.listdir(images_dir) if f.lower().endswith(exts)):
+        if same_folder:
+            # Mask must be the .png with the same stem, never the image itself.
+            mask_path = os.path.join(masks_dir, os.path.splitext(fn)[0] + '.png')
+            if not os.path.exists(mask_path) or mask_path == os.path.join(images_dir, fn):
+                continue
+        else:
+            mask_path = find_mask_path(masks_dir, fn)
         if mask_path is None:
             continue
         image = np.array(Image.open(os.path.join(images_dir, fn)).convert('RGB'))
@@ -2388,6 +2413,10 @@ def evaluate_samples_loop(model, samples, device, threshold=0.5, split_name='',
     if output_dir is not None and save_pred_masks:
         pred_mask_dir = os.path.join(output_dir, 'predicted_masks',
                                      _safe_split_dirname(split_name))
+    sal_map_dir = None
+    if output_dir is not None:
+        sal_map_dir = os.path.join(output_dir, 'saliency_maps',
+                                   _safe_split_dirname(split_name))
     print(f"\n[INFO] Evaluating benchmark {split_name}"
           + (" (TTA)" if use_tta else "") + f" — {len(samples)} images")
     for fn, image_np, gt_np in samples:
@@ -2407,6 +2436,12 @@ def evaluate_samples_loop(model, samples, device, threshold=0.5, split_name='',
         pred_bin = postprocess_mask(pred_np, threshold) if use_postprocess else pred_np >= threshold
         if pred_mask_dir is not None:
             _save_predicted_mask(pred_bin, pred_mask_dir, fn)
+        # Continuous uint8 saliency map for threshold-sweep metrics (PySODMetrics).
+        if sal_map_dir is not None:
+            os.makedirs(sal_map_dir, exist_ok=True)
+            sal_u8 = (np.clip(pred_np, 0.0, 1.0) * 255.0).round().astype(np.uint8)
+            Image.fromarray(sal_u8, mode='L').save(
+                os.path.join(sal_map_dir, os.path.splitext(fn)[0] + '.png'))
         sip = sip_metric_scores(pred_np, gt_bin, threshold=threshold)
         dice = dice_score(pred_bin, gt_bin)
         iou = iou_score(pred_bin, gt_bin)
@@ -3225,7 +3260,8 @@ def main():
                 if reg['type'] == 'npy':
                     samples = _samples_from_npy(reg['images_npy'], reg['masks_npy'])
                 else:
-                    samples = _samples_from_dirs(reg['images'], reg['masks'])
+                    samples = _samples_from_dirs(reg['images'], reg['masks'],
+                                                 image_exts=reg.get('image_exts'))
                 if not samples:
                     print(f"[WARN] No samples found for {ds_name}; skipping")
                     continue
