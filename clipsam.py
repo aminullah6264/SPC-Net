@@ -1309,8 +1309,11 @@ class ESCNet(nn.Module):
             if i == 0:
                 pp_points, pp_labels, pp_size = pts, labels, corr.shape[-2:]
 
-        # Add initial prompt correlation as residual to ESC-refined correlation
-        corr = corr + corr_init
+        # Add initial prompt correlation as residual to ESC-refined correlation.
+        # (2026-11, camera-ready) Can be disabled with --no-prompt-residual for
+        # the matched ablation; default (use_prompt_residual=True) is unchanged.
+        if getattr(self, 'use_prompt_residual', True):
+            corr = corr + corr_init
 
         mask, ds2, ds3 = self.mask_decoder(
             img_feats['high'], skips=img_feats['skips'], corr_maps=corr)
@@ -2977,6 +2980,9 @@ def parse_args():
                    help="Disable multi-prompt bank (use single caption only)")
     p.add_argument('--no-adaptive-fallback', action='store_true',
                    help="Disable PPG top-rho fallback; use threshold-only prompts")
+    p.add_argument('--no-prompt-residual', action='store_true',
+                   help="Disable corr_final = corr_N + corr_0 (decoder sees corr_N only). "
+                        "For the matched residual ablation; default keeps the residual.")
     p.add_argument('--no-bidirectional-sam', action='store_true',
                    help="Disable token-to-image SAM attention; use image-to-token only")
     p.add_argument('--simple-decoder', action='store_true',
@@ -3053,6 +3059,10 @@ def main():
             prompt_bank = SALIENT_PROMPT_BANK
         model.setup_prompt_bank(tokenizer, device, prompts=prompt_bank,
                                 bank_size=args.prompt_bank_size)
+
+    # Prompt-residual switch (default True = original behaviour)
+    model.use_prompt_residual = not args.no_prompt_residual
+    print(f"[INFO] Prompt residual: {'ON' if model.use_prompt_residual else 'OFF'}")
 
     # ── Setup improved prompt mechanisms (if selected) ────────────────────────
     K = args.prompt_bank_size  # number of prompts
