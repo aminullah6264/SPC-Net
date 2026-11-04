@@ -11,3 +11,23 @@ __pycache__/
 .DS_Store
 
 /pretrained_models/
+Openvocab-SD/*
+
+# Model checkpoints and archives
+*.pth
+*.pt
+*.zip
+
+# macOS resource forks
+._*
+
+# LaTeX intermediates
+*.aux
+*.log
+*.out
+*.bbl
+*.blg
+*.brf
+*.fls
+*.fdb_latexmk
+*.synctex.gz

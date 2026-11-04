@@ -1,5 +1,14 @@
 #!/usr/bin/env python3
-"""Cumulative SIP ablation harness for SPC-Net/CLIPSAM."""
+"""Cumulative SIP ablation harness for SPC-Net/CLIPSAM.
+
+Enhanced with --gpu, --clip-model, --variants selection, CUDA_VISIBLE_DEVICES
+control, and markdown output alongside CSV/LaTeX.
+
+Usage:
+    python run_ablation.py --gpu 2 --epochs 60 --seed 42 --clip-model ViT-L-14
+    python run_ablation.py --gpu 2 --variants baseline,+mp,+af
+    python run_ablation.py --smoke  # verify output format
+"""
 import argparse
 import csv
 import os
@@ -38,6 +47,10 @@ TEX_COLUMNS = [("s_measure", "S_m", True), ("f_measure", "F_\\beta", True),
 
 def parse_args():
     p = argparse.ArgumentParser(description="Run cumulative SPC-Net SIP ablations")
+    p.add_argument("--gpu", type=int, default=None, help="GPU device ID (sets CUDA_VISIBLE_DEVICES)")
+    p.add_argument("--clip-model", default="ViT-L-14", help="CLIP model variant (default: ViT-L-14)")
+    p.add_argument("--variants", type=str, default=None,
+                   help="Comma-separated subset of variants to run (e.g. 'baseline,+mp,+af')")
     p.add_argument("--epochs", type=int, default=60)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--output-dir", default="outputs_clipSAM")
@@ -53,11 +66,45 @@ def fmt_flags(flags):
 
 def read_metrics(run_dir):
     import yaml
-    with open(Path(run_dir) / "results.yaml") as f:
-        doc = yaml.safe_load(f)
-    if "test" not in doc:
-        raise RuntimeError(f"No test metrics found in {run_dir}/results.yaml")
-    return {key: float(doc["test"][key]["mean"]) for key in METRIC_COLUMNS}
+    import json
+    yaml_path = Path(run_dir) / "results.yaml"
+    
+    # Try reading from results.yaml
+    if yaml_path.exists():
+        with open(yaml_path) as f:
+            doc = yaml.safe_load(f)
+        # Priority: test > validation > benchmarks
+        for section in ["test", "validation"]:
+            if section in doc and doc[section] is not None:
+                try:
+                    return {key: float(doc[section][key]["mean"]) for key in METRIC_COLUMNS}
+                except (KeyError, TypeError):
+                    continue
+    
+    # Fallback: try eval_results.json from benchmark evaluation
+    json_path = Path(run_dir) / "saliency_maps" / "eval_results.json"
+    if json_path.exists():
+        with open(json_path) as f:
+            data = json.load(f)
+        if "DUTS-TE" in data:
+            m = data["DUTS-TE"]
+            return {
+                's_measure': m.get('Sm', 0),
+                'f_measure': m.get('maxFm', 0),
+                'e_measure': m.get('meanEm', 0),
+                'weighted_f': m.get('wFm', 0),
+                'mae': m.get('MAE', 0),
+            }
+    
+    # Fallback: try results_summary.md or benchmark_sip_results.csv
+    csv_path = Path(run_dir) / "sip_results.csv"
+    if csv_path.exists():
+        with open(csv_path) as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                return {key: float(row[key]) for key in METRIC_COLUMNS if key in row}
+    
+    raise RuntimeError(f"No metrics found in {run_dir}")
 
 
 def write_csv(rows, out_path):
@@ -66,6 +113,22 @@ def write_csv(rows, out_path):
         w = csv.DictWriter(f, fieldnames=fields)
         w.writeheader()
         w.writerows(rows)
+
+
+def write_results_md(rows, out_path):
+    """Write ablation results as a markdown table."""
+    lines = [
+        "# Ablation Study Results\n",
+        "| Variant | Sm ↑ | Fβ ↑ | Em ↑ | wFβ ↑ | MAE ↓ |",
+        "|---------|------|------|------|-------|-------|",
+    ]
+    for r in rows:
+        lines.append(
+            f"| {r['variant']} | {float(r['s_measure']):.4f} | {float(r['f_measure']):.4f} | "
+            f"{float(r['e_measure']):.4f} | {float(r['weighted_f']):.4f} | {float(r['mae']):.4f} |"
+        )
+    lines.append("")
+    Path(out_path).write_text("\n".join(lines))
 
 
 def format_tex(rows):
@@ -118,27 +181,64 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
     csv_path = out_dir / "ablation_sip.csv"
     tex_path = out_dir / "ablation_sip.tex"
+    md_path = out_dir / "ablation_results.md"
 
     if args.smoke:
         rows = smoke_rows()
     else:
         rows = []
         extra = args.clipsam_args[1:] if args.clipsam_args[:1] == ["--"] else args.clipsam_args
-        for variant, flags in ABLATION_VARIANTS.items():
+
+        # Determine which variants to run
+        if args.variants:
+            selected = [v.strip() for v in args.variants.split(",")]
+        else:
+            selected = list(ABLATION_VARIANTS.keys())
+
+        for variant in selected:
+            if variant not in ABLATION_VARIANTS:
+                print(f"[WARN] Unknown variant: {variant}, skipping")
+                continue
+            flags = ABLATION_VARIANTS[variant]
             run_dir = out_dir / "ablation_sip" / variant.replace("+", "plus_")
             run_dir.mkdir(parents=True, exist_ok=True)
-            cmd = [sys.executable, "clipsam.py", "--epochs", str(args.epochs),
-                   "--seed", str(args.seed), "--output-dir", str(run_dir), *flags, *extra]
+            cmd = [
+                sys.executable, "clipsam.py",
+                "--clip-model", args.clip_model,
+                "--epochs", str(args.epochs),
+                "--seed", str(args.seed),
+                "--batch-size", "8",
+                "--num-workers", "8",
+                "--mse-lambda", "0.1",
+                "--output-dir", str(run_dir),
+                "--eval-datasets", "DUTS-TE",
+                *flags, *extra,
+            ]
+
+            # Set CUDA_VISIBLE_DEVICES if --gpu specified
+            env = os.environ.copy()
+            if args.gpu is not None:
+                env["CUDA_VISIBLE_DEVICES"] = str(args.gpu)
+
             print(f"\n[ABLATION] {variant}: {' '.join(cmd)}")
-            subprocess.run(cmd, check=True)
-            metrics = read_metrics(run_dir)
-            rows.append({"variant": variant, **metrics, "flags": fmt_flags(flags)})
+            proc = subprocess.run(cmd, env=env)
+            if proc.returncode != 0:
+                print(f"[ERROR] {variant} failed (exit {proc.returncode})")
+                continue
+
+            try:
+                metrics = read_metrics(run_dir)
+                rows.append({"variant": variant, **metrics, "flags": fmt_flags(flags)})
+            except Exception as e:
+                print(f"[ERROR] Could not read metrics for {variant}: {e}")
 
     write_csv(rows, csv_path)
     tex_path.write_text(format_tex(rows))
+    write_results_md(rows, md_path)
     print_summary(rows)
     print(f"\n[INFO] Wrote {csv_path}")
     print(f"[INFO] Wrote {tex_path}")
+    print(f"[INFO] Wrote {md_path}")
     print("\nLaTeX body:\n" + tex_path.read_text())
 
 

@@ -34,6 +34,7 @@ Training improvements
 import os
 import csv
 import json
+import shutil
 import argparse
 import math
 import numpy as np
@@ -60,16 +61,51 @@ from typing import Optional
 #  PATHS  (local server — extracted by setup_dataset.py)
 # ─────────────────────────────────────────────────────────────────────────────
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DATASET  = '/mnt/data/users/av543f/datasets/SIP_Dataset/'
 
-IMG_PATH               = os.path.join(DATASET, 'Train/Images')
-MASK_PATH              = os.path.join(DATASET, 'Train/Masks')
-VALIDATION_IMAGES_PATH = os.path.join(DATASET, 'Test/Images')
-VALIDATION_MASK_PATH   = os.path.join(DATASET, 'Test/Masks')
-TEST_IMAGES_PATH       = os.path.join(DATASET, 'Test1/Images')
-TEST_MASK_PATH         = os.path.join(DATASET, 'Test1/Masks')
+DATASET_ROOT = '/mnt/data/projects/CAD_Adaptation/SOD_Datasets'
+IMG_PATH               = os.path.join(DATASET_ROOT, 'DUTS_Dataset/DUTS-TR/DUTS-TR-Image')
+MASK_PATH              = os.path.join(DATASET_ROOT, 'DUTS_Dataset/DUTS-TR/DUTS-TR-Mask')
+VALIDATION_IMAGES_PATH = os.path.join(DATASET_ROOT, 'DUTS_Dataset/DUTS-TE/DUTS-TE-Image')
+VALIDATION_MASK_PATH   = os.path.join(DATASET_ROOT, 'DUTS_Dataset/DUTS-TE/DUTS-TE-Mask')
+# No default test path — use --eval-datasets for multi-dataset eval
+TEST_IMAGES_PATH       = ''
+TEST_MASK_PATH         = ''
 OUTPUT_DIR             = os.path.join(BASE_DIR, 'outputs_clipSAM')
 PRETRAINED_DIR         = os.path.join(BASE_DIR, 'pretrained_models')
+
+SOD_DATASET_ROOT = '/mnt/data/projects/CAD_Adaptation/SOD_Datasets'
+BENCHMARK_REGISTRY = {
+    'DUTS-TE': {
+        'images': os.path.join(SOD_DATASET_ROOT, 'DUTS_Dataset/DUTS-TE/DUTS-TE-Image'),
+        'masks': os.path.join(SOD_DATASET_ROOT, 'DUTS_Dataset/DUTS-TE/DUTS-TE-Mask'),
+        'type': 'directory',
+    },
+    'DUT-O': {
+        'images': os.path.join(SOD_DATASET_ROOT, 'DUT-O/DUT-OMRON-image'),
+        'masks': os.path.join(SOD_DATASET_ROOT, 'DUT-O/pixelwiseGT-new-PNG'),
+        'type': 'directory',
+    },
+    'ECSSD': {
+        'images': os.path.join(SOD_DATASET_ROOT, 'ECSSD/images'),
+        'masks': os.path.join(SOD_DATASET_ROOT, 'ECSSD/ground_truth_mask'),
+        'type': 'directory',
+    },
+    'HKU-IS': {
+        'images_npy': os.path.join(SOD_DATASET_ROOT, 'HKU-IS/images.npy'),
+        'masks_npy': os.path.join(SOD_DATASET_ROOT, 'HKU-IS/gt.npy'),
+        'type': 'npy',
+    },
+    'PASCAL-S': {
+        'images_npy': os.path.join(SOD_DATASET_ROOT, 'pascals/pascals_test_images.npy'),
+        'masks_npy': os.path.join(SOD_DATASET_ROOT, 'pascals/pascals_test_masks.npy'),
+        'type': 'npy',
+    },
+    'SIP': {
+        'images': os.path.join(SOD_DATASET_ROOT, 'SIP_Dataset/Test/Images'),
+        'masks': os.path.join(SOD_DATASET_ROOT, 'SIP_Dataset/Test/Masks'),
+        'type': 'directory',
+    },
+}
 
 # Salient-object caption (better CLIP alignment for SIP)
 CAPTION = "a photo of a salient object"
@@ -106,6 +142,38 @@ SALIENT_PROMPT_BANK = [
     "a high contrast object against its background",
     "a complete object mask for the main subject",
     "the object that attracts visual attention",
+]
+
+RANDOM_PROMPT_BANK = [
+    "a photograph taken outdoors",
+    "an image with various colors",
+    "a scene with natural lighting",
+    "a picture containing different textures",
+    "a visual with multiple elements",
+    "an everyday scene captured on camera",
+    "a composition with foreground and background",
+    "a photograph of an everyday setting",
+    "an image showing depth and perspective",
+    "a captured moment in time",
+]
+
+# Improved prompt bank: semantically diverse prompts that cover different
+# object categories and visual properties CLIP actually understands.
+# Previous bank had 10 paraphrases of "salient object" — these are diverse.
+DIVERSE_PROMPT_BANK = [
+    # Category-specific (CLIP trained on real captions with these)
+    "a person standing in the scene",
+    "an animal in a natural environment",
+    "a vehicle on the road",
+    "a close-up of an everyday object",
+    # Spatial/structural (foreground-background separation)
+    "the main subject in the foreground",
+    "a large object in the center of the image",
+    "something that stands out from the background",
+    # Visual properties CLIP understands from training data
+    "a brightly colored object in focus",
+    "a sharp subject with blurred background",
+    "a clearly visible object against a plain background",
 ]
 
 
@@ -627,7 +695,9 @@ class VLFBlock(nn.Module):
         img_v   = img_cat.flatten(2).permute(2, 0, 1)
         # Text key/value: one text vector per batch item, expanded for N_c
         # Shape: (1, B·Nc, C)
-        txt_k   = (self.txt_proj(txt_embeds)                              # (B, C)
+        # Handle txt_embeds with batch=1 (shared caption) vs batch=B (per-image)
+        te = txt_embeds if txt_embeds.shape[0] == B else txt_embeds.expand(B, -1)
+        txt_k   = (self.txt_proj(te)                                      # (B, C)
                        .unsqueeze(1).expand(-1, N_c, -1)                  # (B, Nc, C)
                        .reshape(B * N_c, self.feature_dim)                # (B·Nc, C)
                        .unsqueeze(0))                                      # (1, B·Nc, C)
@@ -801,20 +871,34 @@ class ESCNet(nn.Module):
     """
     ESC-Net adapted for binary salient object segmentation.
 
-    Vision backbone : CLIP ViT-B/16  (replaces RN50 in original Colab code)
-    Multi-scale features extracted via forward hooks on transformer blocks
-    [2, 5, 8, 11], reshaped from (seq, B, C) → (B, C, H, W) spatial maps.
+    Vision backbone : CLIP ViT-B/16 or ViT-L/14  (configurable via clip_arch)
+    Multi-scale features extracted via forward hooks on transformer blocks,
+    reshaped from (seq, B, C) → (B, C, H, W) spatial maps.
     """
-    # ViT-B/16 constants
-    VIT_FEAT_DIM  = 768    # ViT hidden dimension
-    CLIP_PROJ_DIM = 512    # CLIP shared embedding space
-    HOOK_INDICES  = [2, 5, 8, 11]   # transformer block indices (0-based)
+    # Architecture configurations for supported CLIP models
+    ARCH_CONFIG = {
+        'ViT-B-16': {'feat_dim': 768, 'proj_dim': 512, 'hooks': [2, 5, 8, 11], 'patch_size': 16, 'num_blocks': 12},
+        'ViT-L-14': {'feat_dim': 1024, 'proj_dim': 768, 'hooks': [5, 11, 17, 23], 'patch_size': 14, 'num_blocks': 24},
+    }
 
     def __init__(self, clip_model, sam_model,
                  num_blocks=4, num_prompts=5,
                  adaptive_fallback=True, bidirectional_sam=True,
-                 simple_decoder=False):
+                 simple_decoder=False, clip_arch='ViT-L-14',
+                 prompt_agg='max'):
         super().__init__()
+
+        # ── Architecture config lookup ────────────────────────────────────────
+        if clip_arch not in self.ARCH_CONFIG:
+            raise ValueError(f"Unsupported clip_arch '{clip_arch}'. "
+                             f"Choose from: {list(self.ARCH_CONFIG.keys())}")
+        cfg = self.ARCH_CONFIG[clip_arch]
+        self.feat_dim     = cfg['feat_dim']
+        self.proj_dim     = cfg['proj_dim']
+        self.hook_indices = cfg['hooks']
+        self.patch_size   = cfg['patch_size']
+        self.clip_arch    = clip_arch
+        self.prompt_agg   = prompt_agg
 
         # ── CLIP visual encoder ───────────────────────────────────────────────
         self.clip_visual = clip_model.visual
@@ -823,15 +907,15 @@ class ESCNet(nn.Module):
         self.token_embedding = clip_model.token_embedding
         self.pos_embed       = clip_model.positional_embedding
         self.ln_final        = clip_model.ln_final
-        self.text_proj       = clip_model.text_projection   # Parameter (512, 512)
+        self.text_proj       = clip_model.text_projection   # Parameter (proj_dim, proj_dim)
 
-        # Visual → CLIP projection (768 → 512) for correlation computation.
+        # Visual → CLIP projection (feat_dim → proj_dim) for correlation computation.
         # Works whether clip_model.visual.proj is nn.Linear or nn.Parameter.
         vp = clip_model.visual.proj
         if isinstance(vp, nn.Parameter):
-            proj_data = vp.data.clone()           # shape (768, 512)
+            proj_data = vp.data.clone()           # shape (feat_dim, proj_dim)
         elif isinstance(vp, nn.Linear):
-            proj_data = vp.weight.data.T.clone()  # Linear stores (out, in); we need (768, 512)
+            proj_data = vp.weight.data.T.clone()  # Linear stores (out, in); we need (feat_dim, proj_dim)
         else:
             raise TypeError(f"Unexpected visual.proj type: {type(vp)}")
         # Learnable parameter — fine-tuned together with new layers
@@ -841,13 +925,12 @@ class ESCNet(nn.Module):
         # Hooks populate self._hook_cache during each forward pass.
         self._hook_cache: dict = {}
         self._hook_handles  = []
-        for level, idx in enumerate(self.HOOK_INDICES):
+        for level, idx in enumerate(self.hook_indices):
             h = self.clip_visual.transformer.resblocks[idx].register_forward_hook(
                 self._make_hook(level))
             self._hook_handles.append(h)
 
         # ── Derive patch grid size from CLIP model ────────────────────────────
-        # For ViT-B/16 @ 336px: (336 / 16)^2 = 21^2 = 441 patches
         if hasattr(self.clip_visual, 'image_size'):
             img_sz = self.clip_visual.image_size
         else:
@@ -855,8 +938,8 @@ class ESCNet(nn.Module):
         # image_size can be an int or a (H, W) tuple depending on open_clip version
         if isinstance(img_sz, (tuple, list)):
             img_sz = img_sz[0]
-        patch_sz = 16   # ViT-B/16
-        self.grid_h = self.grid_w = img_sz // patch_sz   # = 21
+        patch_sz = self.patch_size
+        self.grid_h = self.grid_w = img_sz // patch_sz
 
         # ── SAM esc blocks ────────────────────────────────────────────────────
         try:
@@ -865,23 +948,23 @@ class ESCNet(nn.Module):
             dec_blocks = list(sam_model.mask_decoder.transformer.children())
 
         num_blocks = min(num_blocks, len(dec_blocks))
-        text_dim   = self.CLIP_PROJ_DIM   # 512
+        text_dim   = self.proj_dim
 
         self.esc_blocks = nn.ModuleList([
             ESCBlock(dec_blocks[i], sam_model.prompt_encoder,
-                     self.VIT_FEAT_DIM, num_prompts, text_dim,
+                     self.feat_dim, num_prompts, text_dim,
                      adaptive_fallback=adaptive_fallback,
                      bidirectional_sam=bidirectional_sam)
             for i in range(num_blocks)
         ])
 
-        # ── Decoder  (all ViT skip dims = 768) ─────────────────────────────────
+        # ── Decoder  (all ViT skip dims = feat_dim) ─────────────────────────────
         decoder_cls = SimpleMaskDecoder if simple_decoder else MaskDecoder
         self.mask_decoder = decoder_cls(
-            feature_dim = self.VIT_FEAT_DIM,
-            skips_dims  = [self.VIT_FEAT_DIM,
-                           self.VIT_FEAT_DIM,
-                           self.VIT_FEAT_DIM],
+            feature_dim = self.feat_dim,
+            skips_dims  = [self.feat_dim,
+                           self.feat_dim,
+                           self.feat_dim],
             corr_ch = 2,
             dropout = 0.2)
 
@@ -937,7 +1020,7 @@ class ESCNet(nn.Module):
         return {'high': high, 'mid': mid, 'skips': [l0, l1, l2]}
 
     def _encode_text(self, tokens: torch.Tensor) -> torch.Tensor:
-        """CLIP text encoder → L2-normalised text embeddings (B, 512)."""
+        """CLIP text encoder → L2-normalised text embeddings (B, proj_dim)."""
         t   = self.token_embedding(tokens) + self.pos_embed
         t   = self.ln_final(t)
         eot = tokens.argmax(dim=-1)
@@ -946,19 +1029,19 @@ class ESCNet(nn.Module):
 
     def _project_visual(self, feat: torch.Tensor) -> torch.Tensor:
         """
-        Project spatial visual features from ViT space (768) to CLIP space (512).
-        feat: (B, 768, H, W) → (B, 512, H, W)
+        Project spatial visual features from ViT space (feat_dim) to CLIP space (proj_dim).
+        feat: (B, feat_dim, H, W) → (B, proj_dim, H, W)
         """
         B, C, H, W = feat.shape
-        flat = feat.permute(0, 2, 3, 1).reshape(B * H * W, C)     # (B*H*W, 768)
-        proj = flat @ self.vis_proj_w                               # (B*H*W, 512)
+        flat = feat.permute(0, 2, 3, 1).reshape(B * H * W, C)     # (B*H*W, feat_dim)
+        proj = flat @ self.vis_proj_w                               # (B*H*W, proj_dim)
         return F.normalize(proj.view(B, H, W, -1).permute(0, 3, 1, 2), dim=1)
 
     # ─────────────────────────────────────────────────────────────────────────
     #  Multi-prompt text bank
     # ─────────────────────────────────────────────────────────────────────────
     def setup_prompt_bank(self, bank_tokenizer, device,
-                          prompts=None):
+                          prompts=None, bank_size=None):
         """
         Pre-encode a list of text prompts and register them as a non-trainable
         buffer.  Must be called once after the model is moved to `device`.
@@ -970,12 +1053,16 @@ class ESCNet(nn.Module):
         device : str or torch.device
         prompts : list[str] | None
             Defaults to SALIENT_PROMPT_BANK.
+        bank_size : int | None
+            If provided, slice prompts to the first K entries.
         """
         if prompts is None:
             prompts = SALIENT_PROMPT_BANK
+        if bank_size is not None:
+            prompts = prompts[:bank_size]
         tokens = bank_tokenizer(prompts).to(device)          # (K, L)
         with torch.no_grad():
-            embeds = self._encode_text(tokens)               # (K, 512)
+            embeds = self._encode_text(tokens)               # (K, proj_dim)
         # register_buffer keeps the tensor on the right device when model is
         # moved, and excludes it from optimizer updates.
         self.register_buffer('_bank_embeds', embeds)
@@ -984,6 +1071,87 @@ class ESCNet(nn.Module):
 
     def _has_bank(self) -> bool:
         return hasattr(self, '_bank_embeds') and self._bank_embeds is not None
+
+    # ─────────────────────────────────────────────────────────────────────────
+    #  Improved Multi-Prompt Mechanisms
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def setup_learnable_prompts(self, K: int, device, init_from_bank: bool = True):
+        """
+        Mode 'learnable': Replace frozen CLIP text embeddings with K trainable
+        vectors in CLIP's projection space. Optionally initialized from the
+        frozen bank embeddings so training starts from a reasonable point.
+
+        These are nn.Parameters that receive gradients through the correlation →
+        PPG → decoder → loss path, allowing the prompts to specialize for what
+        ViT-L actually needs rather than what generic English describes.
+        """
+        if init_from_bank and self._has_bank():
+            # Initialize from the first K frozen embeddings
+            init_data = self._bank_embeds[:K].clone()
+            if init_data.shape[0] < K:
+                # Pad with small random vectors if bank is too small
+                extra = torch.randn(K - init_data.shape[0], self.proj_dim,
+                                    device=device) * 0.02
+                extra = F.normalize(extra, dim=-1)
+                init_data = torch.cat([init_data, extra], dim=0)
+        else:
+            # Random initialization on the unit sphere
+            init_data = torch.randn(K, self.proj_dim, device=device) * 0.02
+            init_data = F.normalize(init_data, dim=-1)
+
+        self.learnable_prompts = nn.Parameter(init_data)  # (K, proj_dim)
+        print(f"[INFO] Learnable prompts: {K} vectors ({self.proj_dim}-d), "
+              f"init_from_bank={init_from_bank}")
+
+    def setup_attention_aggregation(self, K: int, device):
+        """
+        Mode 'attention': Learn per-pixel attention weights over K prompts.
+
+        Given K correlation maps (B, K, H, W), a small convolutional network
+        predicts attention weights α(i,j,k) at each spatial location, then
+        aggregates: corr(i,j) = Σ_k α(i,j,k) · corr_k(i,j).
+
+        This is strictly more expressive than max: the model can learn to
+        replicate max (put all weight on the strongest prompt) or learn soft
+        combinations that suppress noisy prompts at specific locations.
+        """
+        # Lightweight attention network: takes K-channel correlation input,
+        # outputs K-channel softmax weights
+        self.prompt_attn = nn.Sequential(
+            nn.Conv2d(K, K * 4, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(K * 4),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(K * 4, K, kernel_size=1, bias=True),
+            # No softmax here — applied in compute_corr for numerical stability
+        ).to(device)
+        # Initialize the final conv bias to 0 → uniform attention at start
+        nn.init.zeros_(self.prompt_attn[-1].bias)
+        print(f"[INFO] Attention aggregation: {K} prompts, "
+              f"conv attention network initialized")
+
+    def setup_prompt_gating(self, K: int, device):
+        """
+        Mode 'gated': A lightweight gating network that takes the global image
+        representation (GAP of visual features) and outputs K sigmoid gates.
+
+        gate_k ∈ [0, 1] per image — determines how much each prompt contributes.
+        Sparse: most gates can learn to be near 0 for irrelevant prompts.
+
+        Aggregation: corr(i,j) = max_k [ gate_k · corr_k(i,j) ]
+        (gated max — prompts with gate≈0 are effectively disabled)
+        """
+        self.prompt_gate = nn.Sequential(
+            nn.Linear(self.proj_dim, K * 2),
+            nn.ReLU(inplace=True),
+            nn.Linear(K * 2, K),
+            # Sigmoid applied in compute_corr
+        ).to(device)
+        # Initialize to slight positive bias → all prompts active initially
+        nn.init.zeros_(self.prompt_gate[-1].weight)
+        nn.init.constant_(self.prompt_gate[-1].bias, 1.0)  # sigmoid(1) ≈ 0.73
+        print(f"[INFO] Prompt gating: {K} prompts, "
+              f"gate network initialized (bias=1.0 → all active initially)")
 
     # ─────────────────────────────────────────────────────────────────────────
 
@@ -998,41 +1166,94 @@ class ESCNet(nn.Module):
         """
         Compute normalised cosine-similarity correlation maps.
 
-        When a prompt bank has been set up via `setup_prompt_bank`, this
-        computes a correlation map for every bank prompt *plus* the per-sample
-        caption, then takes the element-wise maximum over all prompts.
-        The maximum aggregation ensures that even small salient-object regions that
-        only respond to one specific prompt are not suppressed.
+        Supports four prompt modes (controlled by self.prompt_agg):
+          'max'       — original: fixed bank + element-wise max (WACV submission)
+          'mean'      — fixed bank + element-wise mean
+          'learnable' — trainable prompt embeddings + attention aggregation
+          'attention' — fixed bank + learned per-pixel attention weights
+          'gated'     — fixed bank + image-conditioned gate per prompt
 
-        Without a bank it falls back to the original single-prompt behaviour.
+        Without a bank and not in learnable mode, falls back to single-prompt.
 
         Returns (B, 2, H, W): [high-level corr, mid-level corr].
         """
-        high_proj = self._project_visual(feats['high'])   # (B, 512, H, W)
-        mid_proj  = self._project_visual(feats['mid'])    # (B, 512, H, W)
+        high_proj = self._project_visual(feats['high'])   # (B, proj_dim, H, W)
+        mid_proj  = self._project_visual(feats['mid'])    # (B, proj_dim, H, W)
 
-        if self._has_bank():
-            # ── Multi-prompt path ─────────────────────────────────────────────
-            # bank:   (K, 512)  — shared for all samples
-            # single: (B, 512)  — per-sample caption embedding
+        # ── Determine prompt embeddings to use ────────────────────────────────
+        if self.prompt_agg == 'learnable' and hasattr(self, 'learnable_prompts'):
+            # Learnable mode: use trainable prompt vectors (normalized)
+            bank = F.normalize(self.learnable_prompts, dim=-1)  # (K, proj_dim)
+            high_bank = torch.einsum('bchw,kc->bkhw', high_proj, bank)
+            mid_bank  = torch.einsum('bchw,kc->bkhw', mid_proj, bank)
 
-            # Correlation with every bank prompt:  (B, K, H, W)
-            high_bank = torch.einsum('bchw,kc->bkhw', high_proj, self._bank_embeds)
-            mid_bank  = torch.einsum('bchw,kc->bkhw', mid_proj,  self._bank_embeds)
+            # Aggregate with learned soft attention (dot-product based)
+            # Each prompt's contribution is weighted by how strongly it correlates
+            # globally — strong prompts get more weight
+            attn_weights = high_bank.mean(dim=(-2, -1))  # (B, K) global strength
+            attn_weights = F.softmax(attn_weights / 0.1, dim=-1)  # temperature-scaled
+            # Weighted sum: (B, K, H, W) × (B, K, 1, 1) → sum → (B, H, W)
+            high_corr = (high_bank * attn_weights.unsqueeze(-1).unsqueeze(-1)).sum(dim=1)
+            mid_corr  = (mid_bank * attn_weights.unsqueeze(-1).unsqueeze(-1)).sum(dim=1)
+
+        elif self.prompt_agg == 'attention' and hasattr(self, 'prompt_attn'):
+            # Attention mode: fixed bank + learned spatial attention
+            bank = self._bank_embeds  # (K, proj_dim) frozen
+            high_bank = torch.einsum('bchw,kc->bkhw', high_proj, bank)  # (B,K,H,W)
+            mid_bank  = torch.einsum('bchw,kc->bkhw', mid_proj, bank)
+
+            # Predict per-pixel attention weights from correlation patterns
+            attn_logits = self.prompt_attn(high_bank)  # (B, K, H, W)
+            attn_weights = F.softmax(attn_logits, dim=1)  # normalize over K prompts
+            # Weighted sum aggregation
+            high_corr = (high_bank * attn_weights).sum(dim=1)  # (B, H, W)
+            # Use same attention weights for mid (they share spatial structure)
+            mid_attn_logits = self.prompt_attn(mid_bank)
+            mid_attn_weights = F.softmax(mid_attn_logits, dim=1)
+            mid_corr = (mid_bank * mid_attn_weights).sum(dim=1)
+
+        elif self.prompt_agg == 'gated' and hasattr(self, 'prompt_gate'):
+            # Gated mode: fixed bank + image-conditioned gates
+            bank = self._bank_embeds  # (K, proj_dim) frozen
+            high_bank = torch.einsum('bchw,kc->bkhw', high_proj, bank)  # (B,K,H,W)
+            mid_bank  = torch.einsum('bchw,kc->bkhw', mid_proj, bank)
+
+            # Compute gates from global average of projected visual features
+            # Use high_proj GAP as the image representation
+            img_global = high_proj.mean(dim=(-2, -1))  # (B, proj_dim)
+            gates = torch.sigmoid(self.prompt_gate(img_global))  # (B, K)
+
+            # Apply gates: suppress irrelevant prompts, then max over active ones
+            gates_hw = gates.unsqueeze(-1).unsqueeze(-1)  # (B, K, 1, 1)
+            high_gated = high_bank * gates_hw  # (B, K, H, W) — gated correlations
+            mid_gated  = mid_bank * gates_hw
+
+            # Max over gated prompts — disabled prompts (gate≈0) don't contribute
+            high_corr = high_gated.max(dim=1).values  # (B, H, W)
+            mid_corr  = mid_gated.max(dim=1).values
+
+        elif self._has_bank():
+            # ── Original multi-prompt path (max or mean) ──────────────────────
+            bank = self._bank_embeds
+            high_bank = torch.einsum('bchw,kc->bkhw', high_proj, bank)
+            mid_bank  = torch.einsum('bchw,kc->bkhw', mid_proj, bank)
 
             # Correlation with per-sample caption:  (B, 1, H, W)
-            high_cap  = torch.einsum('bchw,bc->bhw', high_proj, txt_embeds).unsqueeze(1)
-            mid_cap   = torch.einsum('bchw,bc->bhw', mid_proj,  txt_embeds).unsqueeze(1)
+            high_cap = torch.einsum('bchw,bc->bhw', high_proj, txt_embeds).unsqueeze(1)
+            mid_cap  = torch.einsum('bchw,bc->bhw', mid_proj, txt_embeds).unsqueeze(1)
 
-            # Concatenate all K+1 maps and take the max over the prompt axis
-            # so any region activated by ANY prompt is preserved.
-            high_corr = torch.cat([high_bank, high_cap], dim=1).max(dim=1).values  # (B,H,W)
-            mid_corr  = torch.cat([mid_bank,  mid_cap],  dim=1).max(dim=1).values
+            # Concatenate all K+1 maps and aggregate over the prompt axis
+            if self.prompt_agg == 'mean':
+                high_corr = torch.cat([high_bank, high_cap], dim=1).mean(dim=1)
+                mid_corr  = torch.cat([mid_bank, mid_cap], dim=1).mean(dim=1)
+            else:  # 'max' (default)
+                high_corr = torch.cat([high_bank, high_cap], dim=1).max(dim=1).values
+                mid_corr  = torch.cat([mid_bank, mid_cap], dim=1).max(dim=1).values
 
         else:
             # ── Single-prompt fallback ────────────────────────────────────────
-            high_corr = torch.einsum('bchw,bc->bhw', high_proj, txt_embeds)  # (B,H,W)
-            mid_corr  = torch.einsum('bchw,bc->bhw', mid_proj,  txt_embeds)
+            high_corr = torch.einsum('bchw,bc->bhw', high_proj, txt_embeds)
+            mid_corr  = torch.einsum('bchw,bc->bhw', mid_proj, txt_embeds)
 
         high_corr = self._minmax(high_corr)
         mid_corr  = self._minmax(mid_corr)
@@ -1046,13 +1267,39 @@ class ESCNet(nn.Module):
     def forward(self, image: torch.Tensor, text_tokens: torch.Tensor):
         img_feats  = self._extract_clip_feats(image)
         txt_embeds = self._encode_text(text_tokens)
+        # Expand text embeddings to match image batch if needed (shared caption)
+        B = image.shape[0]
+        if txt_embeds.shape[0] == 1 and B > 1:
+            txt_embeds = txt_embeds.expand(B, -1)
         corr       = self.compute_corr(img_feats, txt_embeds)
+
+        # ── Correlation Residual Connection (Architecture B) ──────────────────
+        # CHANGE LOG (2026-08-25):
+        #   Architecture A (WACV submission, runs before 2026-08-25):
+        #     - Initial correlation was used only for PPG point selection
+        #     - VLF blocks completely overwrote correlation over 4 iterations
+        #     - Prompt embeddings had NO gradient path to final output
+        #     - Multi-prompt bank helped only via discrete PPG point locations
+        #
+        #   Architecture B (current, with residual):
+        #     - Initial correlation is preserved and added back after ESC blocks
+        #     - Prompt embeddings have a DIRECT gradient path: loss → decoder → corr → prompts
+        #     - Enables learnable/attention/gated prompt modes to actually learn
+        #     - Also improves fixed-max mode by giving prompt correlation direct influence
+        #
+        # The residual ensures the decoder always sees the prompt-derived spatial prior
+        # in addition to the VLF-refined features. Without it, the prompt bank's
+        # influence is limited to the initial PPG point sampling (non-differentiable).
+        corr_init = corr
 
         pp_points = pp_labels = pp_size = None
         for i, block in enumerate(self.esc_blocks):
             img_feats, corr, (pts, labels) = block(img_feats, txt_embeds, corr)
             if i == 0:
                 pp_points, pp_labels, pp_size = pts, labels, corr.shape[-2:]
+
+        # Add initial prompt correlation as residual to ESC-refined correlation
+        corr = corr + corr_init
 
         mask, ds2, ds3 = self.mask_decoder(
             img_feats['high'], skips=img_feats['skips'], corr_maps=corr)
@@ -1269,6 +1516,37 @@ def sip_metric_scores(pred_prob: np.ndarray, gt_mask: np.ndarray,
         'mae':        float(np.mean(np.abs(pred - gt.astype(np.float64)))),
     }
 
+
+def standard_sod_metrics(pred_prob: np.ndarray, gt_mask: np.ndarray) -> dict:
+    """Standard SOD evaluation: max-Fβ (255 thresholds), mean-Em, Sm, WFβ, MAE."""
+    pred, gt = _prepare_saliency_arrays(pred_prob, gt_mask)
+
+    # Max F-measure across 255 thresholds
+    f_scores = []
+    e_scores = []
+    for i in range(1, 256):
+        thresh = i / 255.0
+        pred_bin = pred >= thresh
+        f_scores.append(f_measure_score(pred_bin, gt))
+        e_scores.append(enhanced_measure(pred_bin, gt))
+
+    max_f = max(f_scores) if f_scores else 0.0
+    mean_e = float(np.mean(e_scores)) if e_scores else 0.0
+
+    # Adaptive F-measure (threshold = 2 * mean of prediction)
+    adaptive_thresh = min(2.0 * pred.mean(), 1.0)
+    adaptive_pred_bin = pred >= adaptive_thresh
+    adp_f = f_measure_score(adaptive_pred_bin, gt)
+
+    return {
+        'max_f': max_f,
+        'mean_e': mean_e,
+        'adp_f': adp_f,
+        's_measure': structure_measure(pred, gt),
+        'weighted_f': weighted_f_measure(pred, gt),
+        'mae': float(np.mean(np.abs(pred - gt.astype(np.float64)))),
+    }
+
 # ─────────────────────────────────────────────────────────────────────────────
 #  POINT CLASSIFICATION AUXILIARY LOSS
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1377,6 +1655,9 @@ class WarmupCosineScheduler(torch.optim.lr_scheduler._LRScheduler):
     def _segment_for(self, ep):
         """Return (seg_index, seg_start, seg_end) for a given epoch."""
         breaks = self._breaks
+        if len(breaks) < 2:
+            # Degenerate case (very short training) — single segment from 0 to total
+            return 0, 0, max(self.total_epochs, 1)
         for i in range(len(breaks) - 1):
             if ep < breaks[i + 1]:
                 return i, breaks[i], breaks[i + 1]
@@ -1422,7 +1703,7 @@ class WarmupCosineScheduler(torch.optim.lr_scheduler._LRScheduler):
 # ─────────────────────────────────────────────────────────────────────────────
 def train_loop(model, dataloader, optimizer, scheduler, device, epochs,
                save_path, pp_loss_weight=0.3, ds_weight=0.3, threshold=0.5,
-               mse_lambda=0.1, plain_bce_loss=False):
+               mse_lambda=0.1, plain_bce_loss=False, save_best_only=False):
     """
     Training loop with:
       • Per-batch NaN/Inf loss guard (skips weight update, logs breakdown)
@@ -1619,7 +1900,8 @@ def train_loop(model, dataloader, optimizer, scheduler, device, epochs,
         # target was the bug: best may have been saved during a 55-NaN epoch,
         # so reloading it kept the model in a corrupted state.
         if nan_batches == 0:
-            torch.save(last_payload, clean_path)
+            if not save_best_only:
+                torch.save(last_payload, clean_path)
             saved_tag = "clean+last"
 
         # ── Checkpoint: best training Dice (only when epoch is clean) ─────────
@@ -1629,7 +1911,13 @@ def train_loop(model, dataloader, optimizer, scheduler, device, epochs,
             best_dice = avg_dice
             best_payload = {**last_payload, 'best_dice': best_dice}
             torch.save(best_payload, save_path)
-            saved_tag = "best+clean+last"
+            saved_tag = "best+clean+last" if not save_best_only else "best"
+
+        # Skip saving last/clean if --save-best-only
+        if save_best_only:
+            if os.path.exists(last_path):
+                os.remove(last_path)
+            saved_tag = saved_tag.replace("+clean+last", "").replace("clean+last", "—").replace("last", "—")
 
         nan_tag = f"{nan_batches}nan" if nan_batches else f"{amp_scale_drops}ovf"
         print(f"{epoch:>6}  {avg_loss:>8.4f}  {avg_dice:>8.4f}  "
@@ -1646,7 +1934,7 @@ def train_loop(model, dataloader, optimizer, scheduler, device, epochs,
 #  THRESHOLD CALIBRATION  (run once on validation, reuse on test)
 # ─────────────────────────────────────────────────────────────────────────────
 def calibrate_threshold(model, images_dir, masks_dir, device,
-                        candidates=None, use_tta=True):
+                        candidates=None, use_tta=False):
     """Sweep candidate thresholds on a held-out split and return the one that
     maximises mean Dice.
 
@@ -1723,7 +2011,7 @@ def calibrate_threshold(model, images_dir, masks_dir, device,
 
 
 def threshold_sweep(model, images_dir, masks_dir, device,
-                    candidates=None, use_tta=True,
+                    candidates=None, use_tta=False,
                     highlight_thresh=None, split_name="Test"):
     """Evaluate *split* at every candidate threshold and return a list of row dicts.
 
@@ -1808,19 +2096,30 @@ def threshold_sweep(model, images_dir, masks_dir, device,
 
 
 def evaluate_loop(model, images_dir, masks_dir, device,
-                  threshold=0.5, split_name="", use_postprocess=True,
-                  use_tta=True, output_dir=None, save_pred_masks=True):
+                  threshold=0.5, split_name="", use_postprocess=False,
+                  use_tta=False, output_dir=None, save_pred_masks=True,
+                  sal_map_dir=None):
     model.eval()
     dice_list, iou_list, missing = [], [], 0
     sip_metrics = {
         'e_measure': [], 's_measure': [], 'weighted_f': [],
         'f_measure': [], 'mae': []
     }
+    std_metrics_acc = {
+        'max_f': [], 'mean_e': [], 'adp_f': [],
+        's_measure': [], 'weighted_f': [], 'mae': []
+    }
     per_image_rows = []
     pred_mask_dir = None
     if output_dir is not None and save_pred_masks:
         pred_mask_dir = os.path.join(output_dir, 'predicted_masks',
                                      _safe_split_dirname(split_name))
+    # Auto-create saliency map directory if output_dir is set
+    if sal_map_dir is None and output_dir is not None:
+        sal_map_dir = os.path.join(output_dir, 'saliency_maps',
+                                   _safe_split_dirname(split_name))
+    if sal_map_dir is not None:
+        os.makedirs(sal_map_dir, exist_ok=True)
 
     image_files = sorted([f for f in os.listdir(images_dir)
                            if f.lower().endswith(IMAGE_EXTENSIONS)])
@@ -1851,6 +2150,13 @@ def evaluate_loop(model, images_dir, masks_dir, device,
         pred_np  = F.interpolate(pred_probs, size=gt_np.shape,
                                   mode='bilinear', align_corners=False
                                   )[0, 0].cpu().numpy()
+
+        # Save raw saliency map for PySODEvalToolkit
+        if sal_map_dir is not None:
+            sal_u8 = (np.clip(pred_np, 0, 1) * 255).astype(np.uint8)
+            Image.fromarray(sal_u8, mode='L').save(
+                os.path.join(sal_map_dir, os.path.splitext(fn)[0] + '.png'))
+
         pred_bin = (postprocess_mask(pred_np, threshold)
                     if use_postprocess else pred_np >= threshold)
         if pred_mask_dir is not None:
@@ -1859,24 +2165,29 @@ def evaluate_loop(model, images_dir, masks_dir, device,
         dice = dice_score(pred_bin, gt_bin)
         iou  = iou_score(pred_bin, gt_bin)
         sip  = sip_metric_scores(pred_np, gt_bin, threshold=threshold)
+        std_met = standard_sod_metrics(pred_np, gt_bin)
 
         dice_list.append(dice)
         iou_list .append(iou)
         for key, value in sip.items():
             sip_metrics[key].append(value)
+        for key, value in std_met.items():
+            std_metrics_acc[key].append(value)
 
         per_image_rows.append({
             'filename': fn,
             'dice': round(float(dice), 6),
             'iou': round(float(iou), 6),
             **{k: round(float(v), 6) for k, v in sip.items()},
+            **{f'std_{k}': round(float(v), 6) for k, v in std_met.items()},
         })
 
     if not dice_list:
         print(f"[WARN] evaluate_loop: no paired images in {split_name}; skipping")
         empty = np.array([], dtype=np.float64)
         return {'dice': empty, 'iou': empty,
-                **{k: empty for k in sip_metrics}}
+                **{k: empty for k in sip_metrics},
+                **{f'std_{k}': empty for k in std_metrics_acc}}
 
     dice_arr = np.array(dice_list)
     iou_arr  = np.array(iou_list)
@@ -1884,6 +2195,7 @@ def evaluate_loop(model, images_dir, masks_dir, device,
         'dice': dice_arr,
         'iou': iou_arr,
         **{k: np.array(v, dtype=np.float64) for k, v in sip_metrics.items()},
+        **{f'std_{k}': np.array(v, dtype=np.float64) for k, v in std_metrics_acc.items()},
     }
 
     pp       = "ON" if use_postprocess else "OFF"
@@ -1899,6 +2211,10 @@ def evaluate_loop(model, images_dir, masks_dir, device,
     print(f"  Weighted-F ↑    : {result['weighted_f'].mean():.4f}  ±  {result['weighted_f'].std():.4f}")
     print(f"  F-Measure ↑     : {result['f_measure'].mean():.4f}  ±  {result['f_measure'].std():.4f}")
     print(f"  MAE ↓           : {result['mae'].mean():.4f}  ±  {result['mae'].std():.4f}")
+    print(f"  --- Standard SOD Protocol ---")
+    print(f"  Max-F ↑         : {result['std_max_f'].mean():.4f}")
+    print(f"  Mean-E ↑        : {result['std_mean_e'].mean():.4f}")
+    print(f"  Adp-F ↑         : {result['std_adp_f'].mean():.4f}")
     print(f"  Best Dice       : {dice_arr.max():.4f}    Worst Dice : {dice_arr.min():.4f}")
     print("=" * 68)
 
@@ -1907,12 +2223,16 @@ def evaluate_loop(model, images_dir, masks_dir, device,
         safe_split = _safe_split_dirname(split_name)
         metrics_csv = os.path.join(output_dir, f'{safe_split}_sip_metrics.csv')
         fields = ['filename', 'dice', 'iou', 'e_measure', 's_measure',
-                  'weighted_f', 'f_measure', 'mae']
+                  'weighted_f', 'f_measure', 'mae',
+                  'std_max_f', 'std_mean_e', 'std_adp_f',
+                  'std_s_measure', 'std_weighted_f', 'std_mae']
         with open(metrics_csv, 'w', newline='') as f:
             writer = csv.DictWriter(f, fieldnames=fields)
             writer.writeheader()
             writer.writerows(per_image_rows)
         print(f"[INFO] Per-image SIP metrics saved → {metrics_csv}")
+    if sal_map_dir is not None:
+        print(f"[INFO] Saliency maps saved → {sal_map_dir}")
     if pred_mask_dir is not None:
         print(f"[INFO] Predicted masks saved → {pred_mask_dir}")
 
@@ -2058,7 +2378,7 @@ def load_benchmark_samples(root: str, name: str):
 
 
 def evaluate_samples_loop(model, samples, device, threshold=0.5, split_name='',
-                          use_postprocess=True, use_tta=True, output_dir=None,
+                          use_postprocess=False, use_tta=False, output_dir=None,
                           save_pred_masks=True):
     model.eval()
     metrics = {'dice': [], 'iou': [], 'e_measure': [], 's_measure': [],
@@ -2128,10 +2448,10 @@ def evaluate_samples_loop(model, samples, device, threshold=0.5, split_name='',
     return result
 
 
-def evaluate_benchmark_suite(model, args, device, threshold, use_tta=True):
+def evaluate_benchmark_suite(model, args, device, threshold, use_tta=False):
     requested = args.eval_benchmarks or []
     if any(x.lower() == 'all' for x in requested):
-        requested = ['ECSSD', 'DUT-O', 'DUTS-TE', 'HKU-IS', 'PASCAL-S']
+        requested = [ 'DUTS-TE', 'DUT-O','HKU-IS', 'ECSSD', 'PASCAL-S']
     summary = []
     for name in requested:
         samples = load_benchmark_samples(args.benchmark_root, name)
@@ -2581,23 +2901,43 @@ def parse_args():
     p.add_argument('--weight-decay', type=float, default=1e-4)
     p.add_argument('--clip-size',    type=int,   default=CLIP_SIZE)
     # Model
+    p.add_argument('--clip-model',   default='ViT-L-14', choices=['ViT-L-14', 'ViT-B-16'],
+                   help="CLIP vision backbone architecture")
     p.add_argument('--num-blocks',   type=int,   default=4,
                    help="Number of ESC blocks (paper uses N=4)")
     p.add_argument('--num-prompts',  type=int,   default=5)
+    p.add_argument('--prompt-bank-size', type=int, default=10,
+                   help='Number of prompts from the bank to use (1-20)')
+    p.add_argument('--prompt-agg', default='max',
+                   choices=['max', 'mean', 'learnable', 'attention', 'gated'],
+                   help='Prompt aggregation mode: max (fixed bank + max-pool), '
+                        'mean (fixed bank + mean), learnable (trainable prompt vectors), '
+                        'attention (fixed bank + learned spatial attention), '
+                        'gated (fixed bank + image-conditioned gates)')
+    p.add_argument('--random-prompts', action='store_true',
+                   help='Replace curated prompt bank with random generic sentences')
+    p.add_argument('--diverse-prompts', action='store_true',
+                   help='Use diverse category-specific prompt bank instead of default paraphrases')
     p.add_argument('--threshold',    type=float, default=0.5)
     p.add_argument('--mse-lambda',  type=float, default=0.1,
                    help="Lambda weight for the MSE term in the segmentation objective")
+    p.add_argument('--eval-datasets', type=str, default='',
+                   help='Comma-separated list of benchmarks to evaluate after training: DUTS-TE,DUT-O,HKU-IS,ECSSD,PASCAL-S,SIP')
     p.add_argument('--train-with-val-data', action='store_true',
                    help="Research-only: append the dedicated validation split to the training loader. Validation is still evaluated/calibrated after training, so reported validation metrics are no longer held-out.")
     # Misc
     p.add_argument('--resume',       default=None,
                    help="Path to checkpoint to resume from")
+    p.add_argument('--save-best-only', action='store_true',
+                   help="Only save escnet_best.pth; skip last/clean checkpoints to save disk space")
     p.add_argument('--test-only',    action='store_true',
                    help="Skip training: load checkpoint (--resume, or escnet_best.pth "
                         "in --output-dir) and run threshold calibration + val/test "
                         "evaluation only.  No dataset or optimiser is constructed.")
     p.add_argument('--no-tta',         action='store_true',
-                   help="Disable test-time augmentation during evaluation")
+                   help="Disable test-time augmentation during evaluation (this is now the default)")
+    p.add_argument('--use-tta',        action='store_true',
+                   help="Enable test-time augmentation during evaluation")
     p.add_argument('--no-prompt-bank', action='store_true',
                    help="Disable multi-prompt bank (use single caption only)")
     p.add_argument('--no-adaptive-fallback', action='store_true',
@@ -2641,17 +2981,17 @@ def main():
     print(f"[INFO] Device : {device}")
     os.makedirs(args.output_dir, exist_ok=True)
 
-    # ── CLIP ViT-B/16 @ 336 × 336  ───────────────────────────────────────────
-    print("[INFO] Loading CLIP ViT-B/16 …")
+    # ── CLIP ViT @ 336 × 336  ─────────────────────────────────────────────────
+    print(f"[INFO] Loading CLIP {args.clip_model} …")
     clip_model, _, _ = open_clip.create_model_and_transforms(
-        model_name='ViT-B-16',
+        model_name=args.clip_model,
         pretrained='openai',
         device=device,
         force_image_size=args.clip_size,   # 336 × 336
         force_quick_gelu=True)             # match OpenAI pretrained activation
 
     global tokenizer
-    tokenizer = open_clip.get_tokenizer('ViT-B-16')
+    tokenizer = open_clip.get_tokenizer(args.clip_model)
 
     # ── SAM ViT-B  ────────────────────────────────────────────────────────────
     sam_ckpt = args.sam_checkpoint or os.path.join(args.pretrained_dir, 'sam_vit_b.pth')
@@ -2665,16 +3005,35 @@ def main():
                    num_prompts=args.num_prompts,
                    adaptive_fallback=not args.no_adaptive_fallback,
                    bidirectional_sam=not args.no_bidirectional_sam,
-                   simple_decoder=args.simple_decoder).to(device)
+                   simple_decoder=args.simple_decoder,
+                   clip_arch=args.clip_model,
+                   prompt_agg=args.prompt_agg).to(device)
 
     if not args.no_prompt_bank:
-        model.setup_prompt_bank(tokenizer, device)
+        if args.random_prompts:
+            prompt_bank = RANDOM_PROMPT_BANK
+        elif args.diverse_prompts:
+            prompt_bank = DIVERSE_PROMPT_BANK
+        else:
+            prompt_bank = SALIENT_PROMPT_BANK
+        model.setup_prompt_bank(tokenizer, device, prompts=prompt_bank,
+                                bank_size=args.prompt_bank_size)
+
+    # ── Setup improved prompt mechanisms (if selected) ────────────────────────
+    K = args.prompt_bank_size  # number of prompts
+    if args.prompt_agg == 'learnable':
+        model.setup_learnable_prompts(K, device, init_from_bank=True)
+    elif args.prompt_agg == 'attention':
+        model.setup_attention_aggregation(K, device)
+    elif args.prompt_agg == 'gated':
+        model.setup_prompt_gating(K, device)
 
     total = sum(p.numel() for p in model.parameters())
-    print(f"[INFO] Model parameters: {total / 1e6:.1f} M")
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"[INFO] Model parameters: {total / 1e6:.1f} M ({trainable / 1e6:.1f} M trainable)")
 
     best_path = os.path.join(args.output_dir, 'escnet_best.pth')
-    use_tta   = not args.no_tta
+    use_tta   = args.use_tta  # Default: no TTA; enable with --use-tta
     history   = {'loss': [], 'dice': [], 'iou': [], 'lr': []}
 
     # ═════════════════════════════════════════════════════════════════════════
@@ -2762,9 +3121,17 @@ def main():
             pp_loss_weight=args.pp_loss_weight, ds_weight=args.ds_weight,
             threshold=args.threshold,
             mse_lambda=args.mse_lambda,
-            plain_bce_loss=args.plain_bce_loss)
+            plain_bce_loss=args.plain_bce_loss,
+            save_best_only=args.save_best_only)
 
         save_training_plots(history, args.output_dir)
+
+        # ── Save final checkpoint (copy of last epoch) ────────────────────────
+        last_path = os.path.join(args.output_dir, 'escnet_last.pth')
+        final_path = os.path.join(args.output_dir, 'escnet_final.pth')
+        if os.path.exists(last_path):
+            shutil.copy2(last_path, final_path)
+            print(f"[INFO] Final checkpoint saved → {final_path}")
 
         # ── Reload best checkpoint ────────────────────────────────────────────
         eval_ckpt = torch.load(best_path, map_location=device)
@@ -2795,7 +3162,7 @@ def main():
         val_results = evaluate_loop(
             model, args.val_img, args.val_mask, device,
             threshold=cal_thresh, split_name="Validation",
-            use_postprocess=True, use_tta=use_tta, output_dir=args.output_dir)
+            use_postprocess=False, use_tta=use_tta, output_dir=args.output_dir)
 
         # ── Test evaluation (GT available for SIP) ──────────────────────────
         test_results   = None
@@ -2806,7 +3173,7 @@ def main():
             test_results = evaluate_loop(
                 model, args.test_img, args.test_mask, device,
                 threshold=cal_thresh, split_name="Test",
-                use_postprocess=True, use_tta=use_tta, output_dir=args.output_dir)
+                use_postprocess=False, use_tta=use_tta, output_dir=args.output_dir)
 
             # ── Optional threshold sweep on test set ──────────────────────────
             if args.threshold_sweep:
@@ -2846,6 +3213,86 @@ def main():
 
     if args.eval_benchmarks:
         evaluate_benchmark_suite(model, args, device, cal_thresh, use_tta=use_tta)
+
+    # ── Multi-dataset evaluation (--eval-datasets) ────────────────────────────
+    eval_dataset_results = {}
+    if args.eval_datasets:
+        eval_ds_names = [s.strip() for s in args.eval_datasets.split(',') if s.strip()]
+        print(f"\n[INFO] Running multi-dataset evaluation: {eval_ds_names}")
+        for ds_name in eval_ds_names:
+            if ds_name in BENCHMARK_REGISTRY:
+                reg = BENCHMARK_REGISTRY[ds_name]
+                if reg['type'] == 'npy':
+                    samples = _samples_from_npy(reg['images_npy'], reg['masks_npy'])
+                else:
+                    samples = _samples_from_dirs(reg['images'], reg['masks'])
+                if not samples:
+                    print(f"[WARN] No samples found for {ds_name}; skipping")
+                    continue
+                result = evaluate_samples_loop(
+                    model, samples, device, threshold=cal_thresh,
+                    split_name=ds_name, use_postprocess=False, use_tta=use_tta,
+                    output_dir=args.output_dir)
+                if len(result.get('mae', [])) > 0:
+                    eval_dataset_results[ds_name] = {
+                        'e_measure': float(result['e_measure'].mean()),
+                        's_measure': float(result['s_measure'].mean()),
+                        'weighted_f': float(result['weighted_f'].mean()),
+                        'f_measure': float(result['f_measure'].mean()),
+                        'mae': float(result['mae'].mean()),
+                        'dice': float(result['dice'].mean()),
+                        'iou': float(result['iou'].mean()),
+                        'n_samples': int(len(result['mae'])),
+                    }
+            else:
+                print(f"[WARN] Dataset '{ds_name}' not in BENCHMARK_REGISTRY; skipping")
+
+    # ── Save results_summary.md ───────────────────────────────────────────────
+    summary_lines = ["# Results Summary\n"]
+    summary_lines.append(f"**Model**: {args.clip_model}  \n")
+    summary_lines.append(f"**Threshold**: {cal_thresh:.4f}  \n")
+    summary_lines.append(f"**TTA**: {'Yes' if use_tta else 'No'}  \n")
+    summary_lines.append(f"**Prompt Aggregation**: {args.prompt_agg}  \n")
+    summary_lines.append(f"**Prompt Bank Size**: {args.prompt_bank_size}  \n\n")
+
+    if val_results is not None and len(val_results.get('mae', [])) > 0:
+        summary_lines.append("## Validation Results\n\n")
+        summary_lines.append("| Metric | Value |\n|--------|-------|\n")
+        summary_lines.append(f"| E-Measure ↑ | {val_results['e_measure'].mean():.4f} |\n")
+        summary_lines.append(f"| S-Measure ↑ | {val_results['s_measure'].mean():.4f} |\n")
+        summary_lines.append(f"| Weighted-F ↑ | {val_results['weighted_f'].mean():.4f} |\n")
+        summary_lines.append(f"| F-Measure ↑ | {val_results['f_measure'].mean():.4f} |\n")
+        summary_lines.append(f"| MAE ↓ | {val_results['mae'].mean():.4f} |\n")
+        summary_lines.append(f"| Dice | {val_results['dice'].mean():.4f} |\n")
+        summary_lines.append(f"| IoU | {val_results['iou'].mean():.4f} |\n\n")
+
+    if test_results is not None and len(test_results.get('mae', [])) > 0:
+        summary_lines.append("## Test Results\n\n")
+        summary_lines.append("| Metric | Value |\n|--------|-------|\n")
+        summary_lines.append(f"| E-Measure ↑ | {test_results['e_measure'].mean():.4f} |\n")
+        summary_lines.append(f"| S-Measure ↑ | {test_results['s_measure'].mean():.4f} |\n")
+        summary_lines.append(f"| Weighted-F ↑ | {test_results['weighted_f'].mean():.4f} |\n")
+        summary_lines.append(f"| F-Measure ↑ | {test_results['f_measure'].mean():.4f} |\n")
+        summary_lines.append(f"| MAE ↓ | {test_results['mae'].mean():.4f} |\n")
+        summary_lines.append(f"| Dice | {test_results['dice'].mean():.4f} |\n")
+        summary_lines.append(f"| IoU | {test_results['iou'].mean():.4f} |\n\n")
+
+    if eval_dataset_results:
+        summary_lines.append("## Benchmark Results\n\n")
+        summary_lines.append("| Dataset | E-Measure ↑ | S-Measure ↑ | Weighted-F ↑ | F-Measure ↑ | MAE ↓ | Dice | IoU | N |\n")
+        summary_lines.append("|---------|-------------|-------------|--------------|-------------|-------|------|-----|---|\n")
+        for ds_name, metrics in eval_dataset_results.items():
+            summary_lines.append(
+                f"| {ds_name} | {metrics['e_measure']:.4f} | {metrics['s_measure']:.4f} | "
+                f"{metrics['weighted_f']:.4f} | {metrics['f_measure']:.4f} | "
+                f"{metrics['mae']:.4f} | {metrics['dice']:.4f} | {metrics['iou']:.4f} | "
+                f"{metrics['n_samples']} |\n")
+        summary_lines.append("\n")
+
+    summary_md_path = os.path.join(args.output_dir, 'results_summary.md')
+    with open(summary_md_path, 'w') as f:
+        f.writelines(summary_lines)
+    print(f"[INFO] Results summary saved → {summary_md_path}")
 
     # ── Save results YAML ─────────────────────────────────────────────────────
     save_results_yaml(history, val_results, test_results,
