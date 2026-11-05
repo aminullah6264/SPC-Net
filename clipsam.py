@@ -707,6 +707,22 @@ class VLFBlock(nn.Module):
         # Text key/value: one text vector per batch item, expanded for N_c
         # Shape: (1, B·Nc, C)
         # Handle txt_embeds with batch=1 (shared caption) vs batch=B (per-image)
+        # (2026-11, camera-ready) txt_embeds may also be (B, T, D): T text tokens
+        # (prompt bank + caption). With a single token the softmax over keys is
+        # always 1, so the output ignores corr/features (see GRADIENT_DIAGNOSTIC.md).
+        if txt_embeds.dim() == 3:
+            te = txt_embeds if txt_embeds.shape[0] == B else txt_embeds.expand(B, -1, -1)
+            T = te.shape[1]
+            txt_k = (self.txt_proj(te)                                    # (B, T, C)
+                         .unsqueeze(1).expand(-1, N_c, -1, -1)            # (B, Nc, T, C)
+                         .reshape(B * N_c, T, self.feature_dim)           # (B·Nc, T, C)
+                         .permute(1, 0, 2))                               # (T, B·Nc, C)
+            img_m, _ = self.txt_attn(query=img_v, key=txt_k, value=txt_k)
+            out = self.out_proj(img_m)
+            out = out.permute(1, 2, 0).view(B, N_c, H, W)
+            if getattr(self, 'residual', False):
+                out = out + corr_maps
+            return out
         te = txt_embeds if txt_embeds.shape[0] == B else txt_embeds.expand(B, -1)
         txt_k   = (self.txt_proj(te)                                      # (B, C)
                        .unsqueeze(1).expand(-1, N_c, -1)                  # (B, Nc, C)
@@ -717,6 +733,9 @@ class VLFBlock(nn.Module):
         # Project to scalar correlation and reshape
         out = self.out_proj(img_m)                                        # (S, B·Nc, 1)
         out = out.permute(1, 2, 0).view(B, N_c, H, W)                   # (B, Nc, H, W)
+        # (2026-11) --vlf-residual: refine instead of replace the correlation.
+        if getattr(self, 'residual', False):
+            out = out + corr_maps
         return out
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1303,9 +1322,16 @@ class ESCNet(nn.Module):
         # influence is limited to the initial PPG point sampling (non-differentiable).
         corr_init = corr
 
+        # (2026-11) --vlf-multi-token: VLF attends over [bank prompts; caption]
+        # instead of the caption alone. Default off = original behaviour.
+        vlf_text = txt_embeds
+        if getattr(self, 'vlf_multi_token', False) and self._has_bank():
+            bank = self._bank_embeds.unsqueeze(0).expand(B, -1, -1)       # (B, K, D)
+            vlf_text = torch.cat([bank, txt_embeds.unsqueeze(1)], dim=1)  # (B, K+1, D)
+
         pp_points = pp_labels = pp_size = None
         for i, block in enumerate(self.esc_blocks):
-            img_feats, corr, (pts, labels) = block(img_feats, txt_embeds, corr)
+            img_feats, corr, (pts, labels) = block(img_feats, vlf_text, corr)
             if i == 0:
                 pp_points, pp_labels, pp_size = pts, labels, corr.shape[-2:]
 
@@ -2983,6 +3009,12 @@ def parse_args():
     p.add_argument('--no-prompt-residual', action='store_true',
                    help="Disable corr_final = corr_N + corr_0 (decoder sees corr_N only). "
                         "For the matched residual ablation; default keeps the residual.")
+    p.add_argument('--vlf-multi-token', action='store_true',
+                   help="VLF text cross-attention over prompt bank + caption (K+1 keys) "
+                        "instead of the caption alone. Requires the prompt bank.")
+    p.add_argument('--vlf-residual', action='store_true',
+                   help="Each VLF block outputs corr_in + refinement instead of replacing "
+                        "the correlation. Keeps the prompt prior through all ESC blocks.")
     p.add_argument('--no-bidirectional-sam', action='store_true',
                    help="Disable token-to-image SAM attention; use image-to-token only")
     p.add_argument('--simple-decoder', action='store_true',
@@ -3063,6 +3095,11 @@ def main():
     # Prompt-residual switch (default True = original behaviour)
     model.use_prompt_residual = not args.no_prompt_residual
     print(f"[INFO] Prompt residual: {'ON' if model.use_prompt_residual else 'OFF'}")
+    model.vlf_multi_token = args.vlf_multi_token
+    print(f"[INFO] VLF text tokens: {'bank+caption' if model.vlf_multi_token else 'caption only'}")
+    for _blk in model.esc_blocks:
+        _blk.vlf.residual = args.vlf_residual
+    print(f"[INFO] VLF in-block residual: {'ON' if args.vlf_residual else 'OFF'}")
 
     # ── Setup improved prompt mechanisms (if selected) ────────────────────────
     K = args.prompt_bank_size  # number of prompts

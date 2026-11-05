@@ -30,23 +30,34 @@ import clipsam
 from clipsam import ESCNet, SALIENT_PROMPT_BANK, SalientObjectDataset
 
 
-def build(clip_model, sam, tokenizer, device, simple_decoder, residual):
+def build(clip_model, sam, tokenizer, device, simple_decoder, residual, multi_token=False,
+          vlf_residual=False):
     m = ESCNet(clip_model, sam, clip_arch='ViT-L-14', prompt_agg='attention',
                simple_decoder=simple_decoder).to(device)
     m.setup_prompt_bank(tokenizer, device, prompts=SALIENT_PROMPT_BANK, bank_size=10)
     m.setup_attention_aggregation(10, device)
     m.use_prompt_residual = residual
+    m.vlf_multi_token = multi_token
+    for blk in m.esc_blocks:
+        blk.vlf.residual = vlf_residual
     m.train()
     return m
 
 
-def vlf_input_sensitivity(model, device, H=24, W=24):
-    """Perturb corr_maps into one VLF block and measure the output change."""
+def vlf_input_sensitivity(model, device, H=24, W=24, n_tokens=1):
+    """Perturb corr_maps into one VLF block and measure the output change.
+
+    n_tokens=1 reproduces the original single-caption VLF; n_tokens=11 mimics
+    the --vlf-multi-token setting (10 bank prompts + caption).
+    """
     vlf = model.esc_blocks[0].vlf
     vlf.eval()
     B, C = 2, model.feat_dim
     feat = torch.randn(B, C, H, W, device=device)
-    txt = torch.randn(B, model.proj_dim, device=device)
+    if n_tokens == 1:
+        txt = torch.randn(B, model.proj_dim, device=device)
+    else:
+        txt = torch.randn(B, n_tokens, model.proj_dim, device=device)
     c1 = torch.rand(B, 2, H, W, device=device)
     c2 = torch.rand(B, 2, H, W, device=device)
     with torch.no_grad():
@@ -75,7 +86,7 @@ def grad_norm(params):
     return (total ** 0.5) if found else 0.0
 
 
-def run_batches(model, loader, tokenizer, device, n_batches):
+def run_batches(model, loader, tokenizer, device, n_batches, use_amp=True):
     groups = {
         'vis_proj_w': [model.vis_proj_w],
         'prompt_attn': list(model.prompt_attn.parameters()),
@@ -91,7 +102,7 @@ def run_batches(model, loader, tokenizer, device, n_batches):
         imgs, masks = imgs.to(device), masks.to(device)
         tokens = tokenizer(list(caps)).to(device)
         model.zero_grad(set_to_none=True)
-        with autocast('cuda', enabled=True):
+        with autocast('cuda', enabled=use_amp):
             logits, _ = model(imgs, tokens)
             logits = F.interpolate(logits, size=masks.shape[-2:], mode='bilinear',
                                    align_corners=False)
@@ -109,6 +120,12 @@ def main():
     ap.add_argument('--batches', type=int, default=50)
     ap.add_argument('--batch-size', type=int, default=8)
     ap.add_argument('--out', required=True)
+    ap.add_argument('--only-multi', action='store_true',
+                    help='Only run the --vlf-multi-token gradient configs')
+    ap.add_argument('--fp32', action='store_true',
+                    help='Disable autocast (avoids fp16 underflow of tiny gradients)')
+    ap.add_argument('--vlf-residual', action='store_true',
+                    help='Enable the in-block VLF residual in the multi-token configs')
     args = ap.parse_args()
     os.makedirs(args.out, exist_ok=True)
 
@@ -132,26 +149,37 @@ def main():
 
     # 1+2: structural checks (simple decoder model is enough for VLF)
     m = build(clip_model, sam, tokenizer, device, simple_decoder=True, residual=True)
-    sens = vlf_input_sensitivity(m, device)
+    sens = vlf_input_sensitivity(m, device, n_tokens=1)
+    sens_multi = vlf_input_sensitivity(m, device, n_tokens=11)
     simple_uses_corr = 'corr_maps' in clipsam.SimpleMaskDecoder.forward.__code__.co_names
     del m; torch.cuda.empty_cache()
 
-    # 3: gradient norms on identical batches for 4 configs
-    summary = {}
+    # 3: gradient norms on identical batches
+    configs = []
+    if not args.only_multi:
+        for simple in (True, False):
+            for residual in (True, False):
+                configs.append((simple, residual, False))
     for simple in (True, False):
         for residual in (True, False):
-            tag = f"{'simple' if simple else 'aspp'}_dec__residual_{'on' if residual else 'off'}"
-            torch.manual_seed(0)
-            g.manual_seed(0)
-            m = build(clip_model, sam, tokenizer, device, simple_decoder=simple, residual=residual)
-            rows = run_batches(m, loader, tokenizer, device, args.batches)
-            with open(os.path.join(args.out, f'{tag}.csv'), 'w', newline='') as f:
-                w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
-                w.writeheader(); w.writerows(rows)
-            summary[tag] = {k: float(np.mean([r[k] for r in rows]))
-                            for k in rows[0] if k != 'batch'}
-            print(tag, {k: f"{v:.3e}" for k, v in summary[tag].items()}, flush=True)
-            del m; torch.cuda.empty_cache()
+            configs.append((simple, residual, True))
+    summary = {}
+    for simple, residual, multi in configs:
+        tag = (f"{'simple' if simple else 'aspp'}_dec__residual_{'on' if residual else 'off'}"
+               f"{'__vlf_multi' if multi else ''}")
+        torch.manual_seed(0)
+        g.manual_seed(0)
+        m = build(clip_model, sam, tokenizer, device, simple_decoder=simple,
+                  residual=residual, multi_token=multi,
+                  vlf_residual=(multi and args.vlf_residual))
+        rows = run_batches(m, loader, tokenizer, device, args.batches, use_amp=not args.fp32)
+        with open(os.path.join(args.out, f'{tag}.csv'), 'w', newline='') as f:
+            w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+            w.writeheader(); w.writerows(rows)
+        summary[tag] = {k: float(np.mean([r[k] for r in rows]))
+                        for k in rows[0] if k != 'batch'}
+        print(tag, {k: f"{v:.3e}" for k, v in summary[tag].items()}, flush=True)
+        del m; torch.cuda.empty_cache()
 
     # Write report data
     with open(os.path.join(args.out, 'summary.csv'), 'w', newline='') as f:
@@ -162,9 +190,12 @@ def main():
     with open(os.path.join(args.out, 'structural.csv'), 'w', newline='') as f:
         w = csv.writer(f); w.writerow(['check', 'value'])
         for k, v in sens.items():
-            w.writerow([f'vlf_{k}', f"{v:.6e}"])
+            w.writerow([f'vlf_1token_{k}', f"{v:.6e}"])
+        for k, v in sens_multi.items():
+            w.writerow([f'vlf_11token_{k}', f"{v:.6e}"])
         w.writerow(['simple_decoder_reads_corr_maps', simple_uses_corr])
-    print('VLF sensitivity:', sens)
+    print('VLF sensitivity (1 token):', sens)
+    print('VLF sensitivity (11 tokens):', sens_multi)
     print('SimpleMaskDecoder reads corr_maps:', simple_uses_corr)
 
 
