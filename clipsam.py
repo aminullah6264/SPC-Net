@@ -46,6 +46,7 @@ from torch.utils.data import Dataset, DataLoader, ConcatDataset
 import open_clip
 from segment_anything import sam_model_registry
 from sklearn.cluster import KMeans
+from threadpoolctl import threadpool_limits
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
 import cv2
@@ -561,7 +562,11 @@ class PseudoPromptGenerator(nn.Module):
                 # Naive threshold-only PPG: empty support emits zero prompts/masks.
                 continue
             n_clusters = min(P, len(coords))
-            km = KMeans(n_clusters=n_clusters, n_init=10, random_state=0).fit(coords)
+            # (2026-11) Single-threaded KMeans: on <600 points, multi-threading
+            # gives no speedup and under CPU contention cost ~880 ms/call vs
+            # ~12 ms single-threaded. Same algorithm and random_state.
+            with threadpool_limits(limits=1):
+                km = KMeans(n_clusters=n_clusters, n_init=10, random_state=0).fit(coords)
 
             for slot in range(n_clusters):
                 region = coords[km.labels_ == slot]
