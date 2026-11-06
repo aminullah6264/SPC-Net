@@ -95,7 +95,38 @@ Extracted from the PDFs in `Openvocab-SD/Related Papers/`: 2048 values with pape
 - Not extractable: Zhou ICCV 2025 (no Sm/F/E/MAE), Positive-Incentive (tables are images).
 - "CSNet" is not named in any source; mapped to CSF-R2 (assumption, to confirm).
 
-## 7. Pending
+## 7. Results so far (2026-11-05 23:45 UTC)
+
+PySODMetrics on continuous maps (`score_unified.py`). The in-house S-measure agrees with PySODMetrics (+AF DUTS-TE 0.9284 vs 0.9292), so the old numbers were not miscomputed.
+
+### VLF fix vs original, +MP (seed 42, 30 epochs)
+
+| Sm | DUTS-TE | DUT-O | ECSSD | HKU-IS | PASCAL-S | SIP |
+|---|---|---|---|---|---|---|
+| +MP original | 0.9269 | 0.8806 | 0.9493 | 0.9397 | 0.8954 | 0.9379 |
+| +MP VLF fix | 0.9252 | 0.8812 | 0.9496 | 0.9402 | 0.8957 | 0.9363 |
+
+Differences are within ±0.002 and go both ways. That is expected: +MP uses the simple decoder, which ignores the correlation, so the fix can only change PPG point selection in ESC blocks 2–4. Seed runs (pending) will show whether these gaps are above noise. The full-model VLF-fix runs are the real test.
+
+### Unified re-evaluation (9 of 20 checkpoints scored)
+
+Sm on all six benchmarks, including PASCAL-S (850 images) for the first time:
+
+| Config | DUTS-TE | DUT-O | ECSSD | HKU-IS | PASCAL-S | SIP |
+|---|---|---|---|---|---|---|
+| Baseline | 0.9270 | 0.8797 | 0.9475 | 0.9402 | 0.8965 | 0.9374 |
+| +MP | 0.9269 | 0.8806 | 0.9493 | 0.9397 | 0.8954 | 0.9379 |
+| +AF | **0.9292** | 0.8825 | 0.9498 | 0.9392 | **0.8987** | 0.9376 |
+| +BiSAM | 0.9255 | 0.8768 | **0.9499** | **0.9403** | 0.8951 | 0.9369 |
+| +Dec | 0.9262 | **0.8872** | 0.9492 | 0.9386 | 0.8975 | 0.9354 |
+| Full + attention | 0.9243 | 0.8828 | 0.9473 | 0.9376 | 0.8933 | 0.9364 |
+| Learnable | 0.9185 | 0.8759 | 0.9424 | 0.9327 | 0.8906 | 0.9334 |
+| Gated | 0.9162 | 0.8774 | 0.9434 | 0.9298 | 0.8902 | 0.9253 |
+| K=1 | 0.9058 | 0.8687 | 0.9326 | 0.9219 | 0.8810 | 0.9252 |
+
+Max-F, mean-E and MAE tables: `unified_eval/<variant>/unified_metrics.csv`.
+
+## 8. Pending
 
 - [ ] Finish the 10 training runs and score them
 - [ ] Finish unified re-evaluation of the 20 existing checkpoints
