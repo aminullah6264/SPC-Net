@@ -126,7 +126,43 @@ Sm on all six benchmarks, including PASCAL-S (850 images) for the first time:
 
 Max-F, mean-E and MAE tables: `unified_eval/<variant>/unified_metrics.csv`.
 
-## 8. Pending
+## 8. Final results (2026-11-06 17:55 UTC): all 10 runs and 20 re-evals done
+
+S-measure, PySODMetrics. "orig" runs are the August seed-42 runs; new runs use seed 42 except the seed rows.
+
+### Residual on vs off (matched seed and epochs)
+
+| Config | DUTS-TE | DUT-O | ECSSD | HKU-IS | PASCAL-S | SIP |
+|---|---|---|---|---|---|---|
+| Full (max), residual ON | 0.9178 | 0.8739 | 0.9420 | 0.9328 | 0.8888 | 0.9305 |
+| Full (max), residual OFF | 0.9209 | 0.8801 | 0.9471 | 0.9368 | 0.8916 | 0.9309 |
+| Full + attn, residual ON | 0.9217 | 0.8767 | 0.9465 | 0.9359 | 0.8931 | 0.9367 |
+| Full + attn, residual ON (rerun) | 0.9243 | 0.8828 | 0.9473 | 0.9376 | 0.8933 | 0.9364 |
+| Full + attn, residual OFF | 0.9223 | 0.8776 | 0.9467 | 0.9362 | 0.8939 | 0.9349 |
+
+Removing the residual does not hurt. With max aggregation it is better on all six datasets; with attention the off run lies between the two on runs.
+
+### VLF fix vs original
+
+| Config | DUTS-TE | DUT-O | ECSSD | HKU-IS | PASCAL-S | SIP |
+|---|---|---|---|---|---|---|
+| +MP orig / fix | 0.9269 / 0.9252 | 0.8806 / 0.8812 | 0.9493 / 0.9496 | 0.9397 / 0.9402 | 0.8954 / 0.8957 | 0.9379 / 0.9363 |
+| +AF orig / fix | 0.9292 / 0.9278 | 0.8825 / 0.8837 | 0.9498 / 0.9482 | 0.9392 / 0.9406 | 0.8987 / 0.8973 | 0.9376 / 0.9351 |
+| Full (max) orig / fix | 0.9178 / 0.9181 | 0.8739 / 0.8765 | 0.9420 / 0.9445 | 0.9328 / 0.9352 | 0.8888 / 0.8947 | 0.9305 / 0.9323 |
+| Full + attn orig / fix | 0.9217 / 0.9248 | 0.8767 / 0.8826 | 0.9465 / 0.9481 | 0.9359 / 0.9369 | 0.8931 / 0.8940 | 0.9367 / 0.9331 |
+
+Simple-decoder configs: mixed, within noise. Full model (max): better on all six (+0.0003 to +0.0059). Full + attention: better on five, worse on SIP (-0.0036). The fixed full models are still below the simple configs.
+
+### Seed variance (seeds 42, 1, 2; mean ± std)
+
+| Config | DUTS-TE | DUT-O | ECSSD | HKU-IS | PASCAL-S | SIP |
+|---|---|---|---|---|---|---|
+| Baseline | 0.9281 ± 0.0010 | 0.8803 ± 0.0009 | 0.9494 ± 0.0018 | 0.9406 ± 0.0006 | 0.8965 ± 0.0009 | 0.9357 ± 0.0015 |
+| +AF | 0.9264 ± 0.0028 | 0.8811 ± 0.0013 | 0.9482 ± 0.0018 | 0.9396 ± 0.0005 | 0.8968 ± 0.0016 | 0.9340 ± 0.0031 |
+
+Over three seeds, +AF does not beat the baseline: the single-seed gain reported in the paper (DUTS-TE 0.9261 → 0.9284) was within run-to-run noise.
+
+## 9. Pending
 
 - [ ] Finish the 10 training runs and score them
 - [ ] Finish unified re-evaluation of the 20 existing checkpoints
