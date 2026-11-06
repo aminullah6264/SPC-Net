@@ -943,6 +943,13 @@ class ESCNet(nn.Module):
         self.pos_embed       = clip_model.positional_embedding
         self.ln_final        = clip_model.ln_final
         self.text_proj       = clip_model.text_projection   # Parameter (proj_dim, proj_dim)
+        # (2026-11) Full CLIP model for the real text encoder. Stored in a list so it
+        # is NOT registered as a submodule: state_dict keys (and old checkpoints) are
+        # unchanged. Its weights are already on the target device.
+        self._clip_full = [clip_model]
+        # Legacy path skipped the text transformer (embedding depended only on token
+        # length). Kept for reproducing the accepted-paper numbers.
+        self.legacy_text_encoder = False
 
         # Visual → CLIP projection (feat_dim → proj_dim) for correlation computation.
         # Works whether clip_model.visual.proj is nn.Linear or nn.Parameter.
@@ -1055,7 +1062,17 @@ class ESCNet(nn.Module):
         return {'high': high, 'mid': mid, 'skips': [l0, l1, l2]}
 
     def _encode_text(self, tokens: torch.Tensor) -> torch.Tensor:
-        """CLIP text encoder → L2-normalised text embeddings (B, proj_dim)."""
+        """CLIP text encoder → L2-normalised text embeddings (B, proj_dim).
+
+        (2026-11, camera-ready) Default runs the full, frozen CLIP text transformer.
+        The legacy path below skipped the transformer, so every prompt embedding
+        depended only on its token length (prompts of equal length were identical).
+        """
+        if not getattr(self, 'legacy_text_encoder', False):
+            with torch.no_grad():
+                emb = self._clip_full[0].encode_text(tokens)
+            return F.normalize(emb.float(), dim=-1)
+        # ── Legacy (accepted-paper) path: no text transformer ────────────────
         t   = self.token_embedding(tokens) + self.pos_embed
         t   = self.ln_final(t)
         eot = tokens.argmax(dim=-1)
@@ -3014,6 +3031,9 @@ def parse_args():
     p.add_argument('--no-prompt-residual', action='store_true',
                    help="Disable corr_final = corr_N + corr_0 (decoder sees corr_N only). "
                         "For the matched residual ablation; default keeps the residual.")
+    p.add_argument('--legacy-text-encoder', action='store_true',
+                   help="Reproduce accepted-paper numbers: skip the CLIP text transformer "
+                        "(embeddings depend only on token length). Default uses the real encoder.")
     p.add_argument('--vlf-multi-token', action='store_true',
                    help="VLF text cross-attention over prompt bank + caption (K+1 keys) "
                         "instead of the caption alone. Requires the prompt bank.")
@@ -3086,6 +3106,8 @@ def main():
                    simple_decoder=args.simple_decoder,
                    clip_arch=args.clip_model,
                    prompt_agg=args.prompt_agg).to(device)
+    model.legacy_text_encoder = args.legacy_text_encoder
+    print(f"[INFO] Text encoder: {'LEGACY (no transformer)' if model.legacy_text_encoder else 'CLIP text transformer (frozen)'}")
 
     if not args.no_prompt_bank:
         if args.random_prompts:
