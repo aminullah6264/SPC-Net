@@ -162,7 +162,23 @@ Simple-decoder configs: mixed, within noise. Full model (max): better on all six
 
 Over three seeds, +AF does not beat the baseline: the single-seed gain reported in the paper (DUTS-TE 0.9261 → 0.9284) was within run-to-run noise.
 
-## 9. Pending
+## 9. Text-encoder bug and retraining (2026-11-06)
+
+`ESCNet._encode_text` skipped the CLIP text transformer: it returned the end-of-text token embedding plus the positional embedding at that position, layer-normalised and projected. Every prompt embedding therefore depended only on its token length.
+
+| Check | Legacy encoder | Real CLIP text encoder |
+|---|---|---|
+| Cosine between same-length prompts | 1.000 (identical) | distinct |
+| Mean pairwise cosine, 10 curated prompts | 0.996 | 0.780 |
+| Distinct vectors in the 10-prompt bank | 4 (lengths 6–9) | 10 |
+
+This explains why random and curated wording gave the same results and why K=1 and K=5 behaved oddly. All accepted-paper numbers came from this legacy path.
+
+Fix (commit `1f2e0f4`): `_encode_text` now runs the full CLIP text transformer under `no_grad` (frozen). The CLIP model is held in a non-registered attribute, so checkpoint keys are unchanged. `--legacy-text-encoder` reproduces the old behaviour: the accepted +AF checkpoint still gives SIP Sm 0.9376 with it.
+
+Retraining queue `run_textfix.sh` (screens `tf_gpu0..3`, outputs `outputs_textfix/`), 15 runs, seed 42 unless noted: +AF (seeds 42, 1, 2), baseline (seeds 42, 1, 2), +MP, +BiSAM, +Dec, full (max), full + attention, K=1, K=5, random wording, diverse wording.
+
+## 10. Pending
 
 - [ ] Finish the 10 training runs and score them
 - [ ] Finish unified re-evaluation of the 20 existing checkpoints
