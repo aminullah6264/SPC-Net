@@ -52,6 +52,19 @@ QUEUE=(
   "baseline_s42|3|$BASELINE --seed 42"
   "baseline_s1|3|$BASELINE --seed 1"
   "random_bank_s42|3|$FULL --random-prompts --seed 42"
+
+  # Residual on/off (residual only reaches the loss through the correlation-aware
+  # decoder, so it is tested on the full model). "_s42" ON runs exist above.
+  "full_max_noresid_s42|0|$FULL --no-prompt-residual --seed 42"
+  "full_max_noresid_s1|0|$FULL --no-prompt-residual --seed 1"
+  "full_max_s1|0|$FULL --seed 1"
+  "full_attention_noresid_s42|1|$FULL --prompt-agg attention --no-prompt-residual --seed 42"
+  "full_attention_noresid_s1|1|$FULL --prompt-agg attention --no-prompt-residual --seed 1"
+  "full_attention_s1|1|$FULL --prompt-agg attention --seed 1"
+  "full_max_noresid_s2|2|$FULL --no-prompt-residual --seed 2"
+  "full_max_s2|2|$FULL --seed 2"
+  "full_attention_noresid_s2|3|$FULL --prompt-agg attention --no-prompt-residual --seed 2"
+  "full_attention_s2|3|$FULL --prompt-agg attention --seed 2"
 )
 
 is_done() {
