@@ -2849,7 +2849,7 @@ def save_results_yaml(history: dict,
 # ─────────────────────────────────────────────────────────────────────────────
 def build_optimizer(model: ESCNet, clip_model, _sam_model,
                     lr_pretrained: float, lr_new: float,
-                    weight_decay: float):
+                    weight_decay: float, freeze_pretrained: bool = False):
     """
     Two parameter groups:
       pre-trained (CLIP attn + SAM decoder) → lr_pretrained (2e-5 default)
@@ -2883,14 +2883,32 @@ def build_optimizer(model: ESCNet, clip_model, _sam_model,
         if id(param) not in pretrained_ids:
             new_params.append(param)
 
+    # (2026-11) --freeze-pretrained: freeze the whole CLIP visual encoder and the
+    # SAM decoder/prompt-encoder blocks; only new modules are trained.
+    # Note: without this flag, CLIP visual non-attention weights fall in the
+    # "new" group (lr_new) because only 'attn' names are collected above.
+    if freeze_pretrained:
+        frozen = set(id(p) for p in model.clip_visual.parameters()) | pretrained_ids
+        for p in model.parameters():
+            if id(p) in frozen:
+                p.requires_grad_(False)
+        pretrained_params = []
+        new_params = [p for p in model.parameters() if p.requires_grad]
+
     print(f"[INFO] Optimiser: {len(pretrained_params)} pre-trained params "
           f"(lr={lr_pretrained:.1e}), "
-          f"{len(new_params)} new params (lr={lr_new:.1e})")
+          f"{len(new_params)} new params (lr={lr_new:.1e})"
+          + (" [pretrained encoders FROZEN]" if freeze_pretrained else ""))
 
-    return torch.optim.AdamW([
-        {'params': pretrained_params, 'lr': lr_pretrained, 'weight_decay': 0.0},
-        {'params': new_params,        'lr': lr_new,        'weight_decay': weight_decay},
-    ])
+    groups = [{'params': new_params, 'lr': lr_new, 'weight_decay': weight_decay}]
+    if pretrained_params:
+        groups.insert(0, {'params': pretrained_params, 'lr': lr_pretrained, 'weight_decay': 0.0})
+    return torch.optim.AdamW(groups)
+    # OLD:
+    # return torch.optim.AdamW([
+    #     {'params': pretrained_params, 'lr': lr_pretrained, 'weight_decay': 0.0},
+    #     {'params': new_params,        'lr': lr_new,        'weight_decay': weight_decay},
+    # ])
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  DEVICE SELECTION
@@ -3031,6 +3049,8 @@ def parse_args():
     p.add_argument('--no-prompt-residual', action='store_true',
                    help="Disable corr_final = corr_N + corr_0 (decoder sees corr_N only). "
                         "For the matched residual ablation; default keeps the residual.")
+    p.add_argument('--freeze-pretrained', action='store_true',
+                   help="Freeze the CLIP visual encoder and SAM blocks; train only new modules")
     p.add_argument('--legacy-text-encoder', action='store_true',
                    help="Reproduce accepted-paper numbers: skip the CLIP text transformer "
                         "(embeddings depend only on token length). Default uses the real encoder.")
@@ -3203,7 +3223,8 @@ def main():
             model, clip_model, sam,
             lr_pretrained=args.lr_pretrained,
             lr_new=args.lr_new,
-            weight_decay=args.weight_decay)
+            weight_decay=args.weight_decay,
+            freeze_pretrained=args.freeze_pretrained)
 
         scheduler = WarmupCosineScheduler(
             optimizer,
