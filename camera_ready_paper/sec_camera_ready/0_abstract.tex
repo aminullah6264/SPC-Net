@@ -1,0 +1,28 @@
+\begin{abstract}
+Salient object detection (SOD) aims to segment the most visually distinctive
+object in a scene. Recent open-vocabulary segmentation networks couple CLIP with
+the Segment Anything Model (SAM) through a vision--language correlation map, but
+they target multi-class recognition and degrade when reduced to the
+class-agnostic, binary SOD setting: a single text prompt aligns poorly with the
+diverse appearance of salient objects, and the induced pseudo prompts collapse for
+small or low-contrast targets. We present \methodname{} (Salient Prompt Combination
+Network), which adapts the SAM--CLIP correlation paradigm to SOD.
+%% OLD (submitted): "through three contributions. First, we identify that iterative
+%% ESC-block refinement erases the initial prompt-derived correlation, severing the
+%% gradient path ... We fix this with a prompt-residual connection ... Second ...
+%% per-pixel attention ... Third, an adaptive-fallback pseudo-prompt generator ...
+%% On five RGB benchmarks ... achieves state-of-the-art S-measure ..."
+\rev{\methodname{} combines a fine-tuned CLIP ViT-L/14 backbone, a bank of $K$
+salient-object prompts encoded by the frozen CLIP text encoder, and an
+adaptive-fallback pseudo-prompt generator that guarantees non-empty spatial
+guidance for SAM. We also analyse how the prompt-derived correlation reaches the
+training loss. In the binary setting, the text cross-attention of the fusion block
+has a single key, so its output does not depend on the correlation; a
+prompt-residual connection restores a gradient path to the prompt branch, but in
+matched three-seed experiments it does not improve accuracy. Prompt aggregation,
+bank size and wording change S-measure by at most $0.006$ on the RGB benchmarks,
+whereas fine-tuning the CLIP visual encoder is worth up to $0.044$. Among the
+compared methods, \methodname{} obtains the best S-measure on four of five RGB
+benchmarks, and on all 929 SIP images it outperforms the listed RGB-D methods using
+RGB input only.}
+\end{abstract}

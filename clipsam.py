@@ -117,6 +117,14 @@ BENCHMARK_REGISTRY = {
         'masks': os.path.join(SOD_DATASET_ROOT, 'SIP_Dataset/Test/Masks'),
         'type': 'directory',
     },
+    # (2026-11) Full SIP (929 images = Train 1-800 + Test 801-929, symlinks).
+    # Models are trained on DUTS-TR only, so all SIP images are unseen; RGB-D
+    # papers report on all 929 images.
+    'SIP-full': {
+        'images': os.path.join(SOD_DATASET_ROOT, 'SIP-full/Images'),
+        'masks': os.path.join(SOD_DATASET_ROOT, 'SIP-full/Masks'),
+        'type': 'directory',
+    },
 }
 
 # Salient-object caption (better CLIP alignment for SIP)

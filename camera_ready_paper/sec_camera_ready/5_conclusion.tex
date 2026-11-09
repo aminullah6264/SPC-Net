@@ -1,0 +1,23 @@
+\section{Conclusion}
+\label{sec:conclusion}
+
+\begin{revpar}
+We presented \methodname{}, which adapts the SAM--CLIP correlation paradigm to
+binary SOD with a fine-tuned CLIP ViT-L/14 encoder, a fixed prompt bank, and an
+adaptive-fallback pseudo-prompt generator. It obtains the best S-measure on four of
+five RGB benchmarks among the compared methods and, with RGB input only,
+outperforms the listed RGB-D methods on SIP. Our analysis shows that the prompt
+residual restores a gradient path without improving accuracy, and that prompt
+design matters far less than adapting the visual encoder.
+
+\noindent\textbf{Limitations.} Several effects are within seed variation, and only
+part of the study uses three seeds. Published F-measure variants differ across
+sources, and the SIP comparison uses different training data than the RGB-D
+methods.
+\end{revpar}
+%% OLD: "three key innovations: a prompt-residual connection ..., a learned per-pixel
+%% attention mechanism ..., and an adaptive-fallback PPG ... (1) the aggregation
+%% mechanism matters more than prompt wording ... (2) architectural simplicity with
+%% smart prompt handling outperforms complex decoders with fixed aggregation ...
+%% achieves state-of-the-art S-measure on five RGB benchmarks and surpasses
+%% depth-based methods on SIP using RGB input only."

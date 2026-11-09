@@ -27,7 +27,7 @@ import py_sod_metrics as M
 
 import clipsam
 
-DATASETS = ['DUTS-TE', 'DUT-O', 'ECSSD', 'HKU-IS', 'PASCAL-S-full', 'SIP']
+DATASETS = ['DUTS-TE', 'DUT-O', 'ECSSD', 'HKU-IS', 'PASCAL-S-full', 'SIP', 'SIP-full']
 FIELDS = ['Sm', 'maxF', 'meanF', 'adpF', 'wF', 'meanE', 'maxE', 'adpE', 'MAE', 'n']
 
 

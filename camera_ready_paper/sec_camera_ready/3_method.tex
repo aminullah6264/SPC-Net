@@ -1,0 +1,273 @@
+\section{Proposed Method}
+\label{sec:method}
+
+\subsection{Overview}
+\label{sec:overview}
+
+ESC-Net~\cite{lee2024escnet} is a one-stage network that couples a frozen
+CLIP~\cite{radford2021learning} encoder with the pre-trained decoder blocks of the
+Segment Anything Model (SAM)~\cite{kirillov2023segment} through a vision--language
+correlation map. \methodname{} adapts this paradigm from multi-class semantic
+segmentation to the class-agnostic, binary problem of salient object detection
+(SOD). \cref{fig:framework} shows the architecture. Given an input image $I$, a
+CLIP ViT-L/14 encoder produces multi-scale visual features $F_v$, while the CLIP
+text encoder embeds a \emph{bank} of $K$ salient-object descriptions into language
+features $F_l$. From these we form a multi-prompt vision--language correlation
+$C \in \mathbb{R}^{2 \times H \times W}$, which is progressively refined by $N$
+stacked \emph{ESC blocks}, each combining a Pseudo Prompt Generator (PPG), a SAM
+block, and a Vision--Language Fusion (VLF) block. \rev{Before decoding, the initial
+prompt-derived correlation is added back to the refined correlation through a
+residual connection (\cref{sec:residual}). A decoder then produces the saliency map
+$M$. We study two variants: a simple configuration with a U-Net decoder trained with
+binary cross-entropy, which produces all main results (\cref{tab:sota,tab:sip_rgbd}),
+and a correlation-aware variant with an ASPP/FPN decoder and a boundary-aware
+compound objective, used in the ablations (\cref{sec:decoder}).}
+%% OLD: "Crucially, the initial prompt-derived correlation is preserved via a residual
+%% connection ... A simple U-Net decoder then produces the saliency map M, and the
+%% whole network is trained end-to-end with a boundary-aware compound objective."
+
+\begin{figure*}[t]
+  \centering
+  \includegraphics[width=\linewidth]{SOD_framework.png}
+  \caption{Overview of \methodname. A CLIP ViT-L/14 encoder provides multi-scale
+    visual features, and the CLIP text encoder embeds a bank of $K$ salient-object
+    prompts. \rev{The $K$ prompt correlations are aggregated (element-wise maximum in
+    the simple configuration; learned per-pixel attention in the correlation-aware
+    variant), refined by $N$ ESC blocks, and the initial correlation is added back
+    through a residual before decoding.} \emph{Stars} mark the components we
+    redesign relative to ESC-Net.}
+  \label{fig:framework}
+\end{figure*}
+
+
+\subsection{Multi-Scale Vision--Language Features}
+\label{sec:features}
+
+We attach forward hooks to the transformer blocks $\{5, 11, 17, 23\}$ of a CLIP
+ViT-L/14 encoder operating at $336 \times 336$, and reshape each block's patch
+tokens into a spatial map of size $H \times W = 24 \times 24$. We denote the
+deepest map by $F_v^{\textit{high}}$ (block $23$) and a mid-level map by
+$F_v^{\textit{mid}}$ (block $11$); the remaining maps are kept as skip features for
+the decoder.
+
+To measure similarity against the language features, the visual maps are
+projected from the ViT hidden dimension ($1024$) to the shared CLIP embedding
+space ($768$) by a learnable matrix $W_v$ initialized from CLIP's own visual
+projection and fine-tuned with the new modules. For a spatial location $i$,
+\begin{equation}
+  \hat{F}_v^{l}(i) = \frac{W_v^{\top} F_v^{l}(i)}{\lVert W_v^{\top} F_v^{l}(i) \rVert},
+  \qquad l \in \{\textit{high}, \textit{mid}\}.
+\end{equation}
+Each text description is encoded by the CLIP text encoder and $\ell_2$-normalized
+to obtain a language embedding in the same space. \rev{The text encoder is kept
+frozen. The implementation used for the submitted version of this paper bypassed
+the text transformer (it projected only the end-of-text token embedding), so every
+prompt embedding depended only on the prompt's token length. We fixed this, and all
+results in this version were retrained with the full CLIP text encoder.}
+
+
+\subsection{Multi-Prompt Vision--Language Correlation}
+\label{sec:corr}
+
+ESC-Net forms its correlation map from the cosine similarity between the visual
+features and a \emph{single} text embedding per class. For SOD this is
+sub-optimal: the appearance of ``salient objects'' is extremely diverse, and any
+one phrasing aligns with only part of that distribution, so a single prompt
+frequently fails to activate small or atypical targets.
+
+We instead maintain a \emph{prompt bank}
+$\mathcal{T} = \{T^1, \dots, T^K\}$ of $K$ diverse salient-object descriptions
+(\eg, ``a photo of a salient object'', ``the most visually distinctive object in
+the scene'', ``a high contrast object against its background''). The bank is
+encoded once into fixed embeddings $\{t_k\}_{k=1}^{K}$; no per-image caption or
+external captioning model is used, so at test time the model consumes only the RGB
+image with all text prompts fixed a priori. For each scale $l$ and each prompt we
+compute a cosine-similarity map,
+\begin{equation}
+  C_k^{l}(i) = \big\langle \hat{F}_v^{l}(i),\; t_k \big\rangle ,
+  \qquad k \in \{1, \dots, K\}.
+\end{equation}
+
+\rev{\subsubsection{Max-pooled aggregation.}
+In the simple configuration the $K$ maps are aggregated by an element-wise maximum,
+$\tilde{C}^{l}(i) = \max_{k} C_k^{l}(i)$, so a region is kept if any prompt
+activates it.}
+
+\subsubsection{Learned prompt-attention aggregation.}
+\rev{As an alternative to the maximum,} we learn per-pixel attention weights that
+determine how much each prompt contributes at each spatial location. A lightweight
+convolutional network
+$\mathcal{A}$ takes the $K$-channel correlation stack as input and produces
+attention logits:
+\begin{equation}
+  \alpha_k^{l}(i) = \frac{\exp\bigl(\mathcal{A}(C^{l})_k(i)\bigr)}
+                         {\sum_{j=1}^{K}\exp\bigl(\mathcal{A}(C^{l})_j(i)\bigr)},
+  \qquad
+  \tilde{C}^{l}(i) = \sum_{k=1}^{K} \alpha_k^{l}(i)\, C_k^{l}(i).
+  \label{eq:attn_agg}
+\end{equation}
+The attention in \cref{eq:attn_agg} is strictly more expressive than max-pooling:
+it can replicate max by concentrating all weight on the strongest prompt, but it
+can also learn soft combinations that suppress noisy false positives at specific
+locations. \rev{The attention network is trained only if the loss depends on the
+aggregated correlation. This holds for the correlation-aware variant, where
+attention and max-pooling are within about $0.003$ $S_m$ of each other
+(\cref{tab:prompt}); in the simple
+configuration the decoder does not read the correlation, so the attention weights
+receive no gradient (\cref{sec:residual}).}
+%% OLD: "Our ablation confirms that attention aggregation consistently outperforms
+%% max-pooling, particularly on challenging datasets with cluttered backgrounds."
+
+We then apply per-sample min--max normalization,
+\begin{equation}
+  C^{l} = \frac{\tilde{C}^{l} - \min \tilde{C}^{l}}
+               {\max \tilde{C}^{l} - \min \tilde{C}^{l} + \epsilon},
+\end{equation}
+and stack the two scales into the correlation tensor
+$C = [\,C^{\textit{high}};\, C^{\textit{mid}}\,] \in \mathbb{R}^{2 \times H \times W}$.
+
+
+\subsection{Prompt-Residual Connection}
+\label{sec:residual}
+
+\begin{revpar}
+Each VLF block (\cref{sec:sam}) ends with a text cross-attention in which the
+visual tokens are queries and the text embeddings are keys and values. In the
+multi-class setting of ESC-Net there is one text token per class, but in binary SOD
+the fusion block receives a single caption embedding, so the attention has one key.
+The softmax over a single key is identically one, so every query returns the same
+value vector and the VLF output is independent of the correlation and the visual
+features (changing either changes the output by exactly zero). The refined
+correlation $C_N$ thus carries no gradient path back to the prompt aggregation or
+the visual projection.
+
+A residual connection restores such a path. Let $C_0$ denote the initial
+multi-prompt correlation and $C_N$ the correlation after $N$ ESC blocks. The decoder
+receives
+\begin{equation}
+  C_{\textit{final}} = C_N + C_0 .
+  \label{eq:residual}
+\end{equation}
+There is no mixing coefficient. With the correlation-aware decoder, which reads
+$C_{\textit{final}}$, the residual is the only route by which the visual projection
+and the attention aggregation receive gradient (\cref{sec:residual_exp}). In a
+matched comparison over three seeds, however, removing the residual does not reduce
+accuracy (\cref{tab:prompt}). The simple decoder does not read the
+correlation, so in the simple configuration the residual has no effect and the
+prompt bank acts only through the discrete pseudo prompts passed to SAM. We report
+the residual as an analysed design element, not as a source of accuracy gains.
+\end{revpar}
+%% OLD (submitted): "we observe that after N refinement iterations the VLF output
+%% becomes entirely determined by its own parameters and the SAM-refined features,
+%% erasing the spatial prior ... We address this with a simple but critical residual
+%% connection ... C_final = C_N + \gamma C_0, where \gamma is a mixing coefficient ...
+%% Our experiments show that without this residual, the multi-prompt bank provides
+%% negligible improvement regardless of the aggregation method; with it, learned
+%% prompt attention yields consistent gains across all benchmarks. We analyse the
+%% choice of \gamma ... a light residual (\gamma=0.3) is both effective and stable."
+%% (The code has no \gamma; the "\gamma" sweep in the submitted Table 6 varied the
+%% point-classification loss weight.)
+
+
+\subsection{Pseudo Prompt Generator with Adaptive Fallback}
+\label{sec:ppg}
+
+\begin{figure}[!t]
+  \centering
+  \includegraphics[width=0.9\linewidth]{PPG_figure.png}
+  \caption{The proposed Pseudo Prompt Generator (PPG). From the correlation map
+    $C$, a spatial softmax yields a probability map $P$, which is thresholded to a
+    binary map $B$ and clustered into $N_o$ regions by $k$-means; the Hadamard
+    product $P \odot$ clusters localizes the per-region maxima, giving $N_o$
+    pseudo points $X_{\textit{pseudo}}$ and pseudo masks $M_{\textit{pseudo}}$ that
+    SAM's prompt encoder maps to sparse and dense prompts. \emph{Star} marks
+    our addition: the \emph{adaptive fallback}, which selects the top-$\rho$
+    fraction of $P$ whenever the binary support $|B|$ is below $\tau$.}
+  \label{fig:ppg}
+\end{figure}
+
+The PPG converts a correlation map into SAM-compatible point and mask prompts
+(\cref{fig:ppg}). Following ESC-Net, we first apply a spatial softmax to the
+(high-level) correlation map to obtain an object-probability map $P$, binarize it with a
+threshold $\alpha$, and cluster the active pixels into $N_o$ regions by $k$-means
+on pixel coordinates~\cite{hartigan1979algorithm}. For each region we emit one
+\emph{pseudo point}, placed at the pixel of maximum probability and assigned a
+positive label, and one \emph{pseudo mask} given by the region support. The $N_o$
+points and masks are embedded by SAM's prompt encoder into sparse and dense
+prompt features.
+
+A direct port of this procedure is unstable for binary SOD. After a softmax over
+$H\!\times\!W$ locations the mean probability is $\approx 1/(HW)$, so a fixed
+threshold demands tens of times the average activation; for diffuse correlation
+maps, which are common early in training and for small or low-contrast salient
+objects, the binary mask is empty and no prompt is produced. We therefore add an
+\emph{adaptive fallback}: whenever the active support falls below a minimum count
+$\tau$, we instead select the top-$\rho$ fraction of $P$,
+\begin{equation}
+  B =
+  \begin{cases}
+    \mathbb{1}\!\left[P > \alpha\right], & \text{if } \big\lvert \mathbb{1}[P > \alpha] \big\rvert \geq \tau, \\[4pt]
+    \mathrm{TopK}_{\rho}(P),            & \text{otherwise,}
+  \end{cases}
+\end{equation}
+where $\tau = \max(4 N_o, \lfloor \rho H W \rfloor)$. Because the softmax always
+has a positive maximum, $\mathrm{TopK}_{\rho}(P)$ is never empty, so the PPG is
+\emph{guaranteed} to deliver substantive spatial guidance to the SAM block in
+every iteration.
+
+
+\subsection{SAM Block and Vision--Language Fusion}
+\label{sec:sam}
+
+The SAM block aggregates spatial context into the visual features using the
+pseudo prompts, reusing the pre-trained transformer decoder blocks of SAM so that
+their learned image--prompt mapping is preserved. \rev{The simple configuration uses
+image-to-token cross-attention only; restoring the token-to-image step of SAM's
+decoder layout (bidirectional attention, BiSAM) is evaluated in the ablation.}
+%% OLD: "We follow the standard SAM decoder layout with bidirectional cross-attention
+%% between prompt tokens and image features."
+
+The VLF block refines the correlation map using the SAM-refined features and
+the language embeddings through Swin-style window attention~\cite{liu2021swin}
+followed by text-guided cross-attention, following CAT-Seg~\cite{cho2024cat}
+and ESC-Net~\cite{lee2024escnet}. After $N$ ESC blocks the prompt-residual
+(\cref{eq:residual}) is applied before decoding. \rev{As discussed in
+\cref{sec:residual}, with a single caption key the text cross-attention makes the
+VLF output input-independent. Our released code also provides an optional variant
+in which the VLF attends over the $K$ bank prompts plus the caption ($K{+}1$ keys)
+and adds its output to the incoming correlation; all results reported here use the
+original block.}
+%% OLD: "so that the segmentation loss can back-propagate through the initial prompt
+%% correlation C_0 as well as the refined C_N."
+
+
+\subsection{Decoder and Training Objective}
+\label{sec:decoder}
+
+\rev{The simple configuration uses a U-Net-style decoder~\cite{ronneberger2015u}
+with bilinear upsampling and skip connections from the CLIP feature maps; it does
+not take the correlation as input. The correlation-aware variant (``Dec'' in the
+ablation) uses an ASPP/FPN decoder~\cite{chen2017rethinking,lin2017feature} that
+injects $C_{\textit{final}}$ as an explicit saliency prior before the final
+prediction layer.}
+%% OLD: "Before the final prediction layer we inject the residual-enhanced correlation
+%% C_final as an explicit saliency prior. Our ablation shows that a simple decoder
+%% with the prompt-residual outperforms a complex ASPP/FPN decoder without it."
+
+\subsubsection{Training objective.}
+\rev{The simple configuration is trained with binary cross-entropy. The
+correlation-aware variant} is trained with a boundary-aware compound loss
+combining Tversky loss~\cite{salehi2017tversky} and Sobel-edge-weighted focal
+BCE~\cite{lin2017focal}, plus a small probability-space MSE term:
+\begin{equation}
+  \mathcal{L} =
+    w_{\textit{tv}}\, \mathcal{L}_{\textit{tv}} +
+    w_{f}\, \mathcal{L}_{\textit{focal}} +
+    \lambda\, \mathcal{L}_{\textit{mse}},
+\end{equation}
+with $w_{\textit{tv}}{=}0.6$, $w_{f}{=}0.4$, and $\lambda{=}0.1$.
+Deep supervision is applied at two intermediate resolutions with weight $0.3$
+\rev{(correlation-aware decoder only). The ablation additionally evaluates an
+auxiliary point-classification loss with weight $\gamma_{\textit{pt}}$, which
+compares the predicted saliency at each pseudo-point location with the ground
+truth.}

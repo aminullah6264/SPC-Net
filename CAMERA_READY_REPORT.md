@@ -185,3 +185,11 @@ Retraining queue `run_textfix.sh` (screens `tf_gpu0..3`, outputs `outputs_textfi
 - [ ] Residual on/off table, VLF-fix table, seed mean ± std
 - [ ] Decide VLF-fix inclusion (user) and residual framing (user)
 - [ ] `main_camera_ready.tex` with red changes + `REVIEW_RESPONSE_MAP.md`
+
+## 11. Final camera-ready (2026-11-09)
+
+- Residual on/off, full model, 3 seeds: the residual does not improve accuracy (OFF is +0.001 to +0.005 S_m with max aggregation on RGB; within noise with attention).
+- Frozen encoders (+AF, 3 seeds): −0.008 to −0.044 S_m → fine-tuning is kept.
+- SIP is now evaluated on all 929 images (`SIP-full`, Train 1–800 + Test 801–929; models are trained only on DUTS-TR). `run_sipfull_eval.sh`.
+- F_β is recomputed at a fixed 0.5 threshold from the saved maps (`compute_f05.py`), because some runs had calibrated 0.45–0.60 during training-time evaluation.
+- Paper: `Openvocab-SD/LVR-WACV2027-submission/main_camera_ready.tex` (8 pages + refs), tables from `make_camera_ready_tables.py`, response in `CAMERA_READY_RESPONSE.md`. A copy is in `camera_ready_paper/` (the Openvocab-SD folder is gitignored).

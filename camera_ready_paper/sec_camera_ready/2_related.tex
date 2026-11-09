@@ -1,0 +1,67 @@
+\section{Related Work}
+\label{sec:related}
+
+\subsection{Salient Object Detection}
+Deep SOD is dominated by fully-supervised encoder--decoder
+networks~\cite{borji2015salient,wang2021salientsurvey}.
+PiCANet~\cite{picanet2018} learns pixel-wise contextual attention, while
+BASNet~\cite{basnet2019} and F3Net~\cite{f3net2020} emphasise boundary quality
+through hybrid losses and feedback refinement. LDF~\cite{ldf2020} decouples body
+and edge learning, PSGLoss~\cite{psgloss2021} introduces a pyramidal structural
+loss, and RCSB~\cite{rcsb2022} performs recursive contour--saliency blending for
+sharp boundaries. Lightweight designs such as CSNet~\cite{csnet2020},
+EDN~\cite{edn2022}, ADMNet~\cite{sod_admnet}, BDFGNet~\cite{sod_bdfgnet}, and
+STNet~\cite{sod_stnet} target efficiency on resource-constrained hardware.
+Transformer backbones brought further gains: VST~\cite{vst2021} casts SOD as
+token-to-token prediction, and more recent works such as MENet~\cite{menet2023}
+and DC-Net~\cite{sod_dcnet} push accuracy with multi-stage enhancement and
+divide-and-conquer decoding. \rev{Closest to our setting, MDSAM~\cite{mdsam2024}
+adapts SAM to SOD with multi-scale adapters and a detail-enhancement module,
+without text prompts; we include it in the comparison of \cref{tab:sota}.} These
+methods learn ``objectness'' purely from
+saliency data and do not exploit the semantic priors available in vision--language
+foundation models. \methodname{} is complementary: it transfers the open-vocabulary
+knowledge of CLIP and the promptable segmentation ability of SAM into the binary
+SOD setting. For scenes where depth is available, RGB-D SOD
+methods~\cite{sod_s2ma,sod_bbsnet,sod_jldcf,sod_spnet,sod_spsn} fuse a dedicated
+depth stream to disambiguate cluttered foregrounds; we compare against them on the
+SIP benchmark using RGB input only.
+
+\subsection{Foundation Models for Dense Prediction}
+SAM~\cite{kirillov2023segment} is a promptable, class-agnostic segmenter trained
+on billion-scale masks; given point, box, or mask prompts it produces high-quality
+object masks, but it carries no semantics and cannot decide \emph{which} object is
+salient~\cite{wu2023samsurvey}. CLIP~\cite{radford2021learning} provides the
+missing semantic alignment through contrastive image--text pretraining, and its
+dense features have become a standard source of open-vocabulary supervision.
+A growing body of work couples the two. CAT-Seg~\cite{cho2024cat} performs
+cost aggregation over a dense CLIP correlation volume for open-vocabulary
+segmentation, and ESC-Net~\cite{lee2024escnet} routes such a correlation into
+SAM's decoder via pseudo prompts, iteratively refining it with stacked
+enhance-segment-correlate blocks. Other open-vocabulary segmenters extract dense
+labels directly from CLIP~\cite{zhou2022maskclip}, adapt CLIP with mask
+proposals~\cite{liang2023ovseg}, or attach lightweight side
+adapters~\cite{xu2023sanlang}. All of these target multi-class recognition;
+\methodname{} adapts the SAM--CLIP correlation paradigm to class-agnostic binary
+SOD, \rev{and analyses the gradient path from the prompt-derived correlation to the
+loss in this setting.}
+%% OLD: "is, to our knowledge, the first to adapt ... and it identifies and fixes the
+%% gradient-flow issue that arises when the correlation is iteratively refined."
+
+\subsection{Prompt Learning for Vision--Language Models}
+Because CLIP's zero-shot behaviour is sensitive to prompt wording, a line of work
+learns prompts rather than hand-crafting them: CoOp~\cite{zhou2022coop} optimises
+continuous context vectors, and CoCoOp~\cite{zhou2022cocoop} conditions them on
+the input image to improve generalisation to unseen classes. Our prompt bank
+is related but operates differently: instead of learning the prompt tokens, we keep
+a fixed bank of $K$ natural-language salient-object descriptions and \rev{study
+how to \emph{aggregate} their correlation maps (max-pooling or learned per-pixel
+attention). In our experiments (\cref{sec:prompt_analysis}) the specific wording,
+the bank size, and the aggregation mode each change S-measure by at most
+$0.006$ on the RGB benchmarks.}
+%% OLD: "Our analysis shows that for SOD the aggregation mechanism matters more than
+%% the specific wording (randomly sampled prompts with learned attention match
+%% carefully curated prompts), which suggests that spatial aggregation, not
+%% prompt-token optimisation, is the key lever ... This is a distinct finding from
+%% the classification-oriented prompt-learning literature, where the exact context
+%% tokens are decisive."
