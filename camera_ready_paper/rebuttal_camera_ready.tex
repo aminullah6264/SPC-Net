@@ -1,0 +1,111 @@
+\documentclass[10pt,twocolumn,letterpaper]{article}
+\usepackage[rebuttal,algorithms]{wacv}
+
+\usepackage{graphicx}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{booktabs}
+
+\input{preamble}
+
+\definecolor{wacvblue}{rgb}{0.21,0.49,0.74}
+\usepackage[pagebackref,breaklinks,colorlinks,allcolors=wacvblue]{hyperref}
+
+\def\wacvPaperID{*****} % *** Enter the WACV / LVR Paper ID here
+\def\confName{WACV}
+\def\confYear{2027}
+
+\newcommand{\rA}{\textbf{[AC]}}
+\newcommand{\rE}{\textbf{[EhUU]}}
+\newcommand{\rK}{\textbf{[erKd]}}
+
+\begin{document}
+
+\title{SPC-Net: Salient Prompt Combination for Foundation-Model Salient Object Detection\\
+\large Response to the Meta-Review and Reviews (Camera-Ready)}
+
+\maketitle
+\thispagestyle{empty}
+\appendix
+
+We thank the AC and reviewers. Each point is followed by the change made (red in
+the paper). Code and per-run metrics will be released.
+
+\section{Changes beyond the reviews}
+\begin{itemize}\itemsep0pt
+\item \textbf{Text encoder.} Our implementation bypassed the CLIP text transformer,
+  so each prompt embedding depended only on its token length. We fixed this and
+  \emph{retrained all reported models} (29 runs) with the frozen CLIP text encoder
+  (Sec.~3.2). The main results changed by at most $0.003$ $S_m$.
+\item \textbf{Fine-tuning.} The paper stated that CLIP and SAM were frozen except
+  $W_v$. In fact the CLIP visual encoder is fine-tuned (attention layers and SAM
+  blocks at $2{\times}10^{-6}$, other layers and new modules at $2{\times}10^{-5}$).
+  Sec.~4.2 now says so, and a new frozen-encoder ablation (3 seeds) shows freezing
+  costs $0.008$--$0.044$ $S_m$ (Tab.~3).
+\item \textbf{Reported configuration.} The reported model (Baseline+MP+AF) uses a
+  U-Net decoder, BCE loss and max aggregation; Secs.~3.1--3.7 now describe it and
+  the correlation-aware variant separately.
+\item \textbf{Tables 4--6 of the submission} contained a duplicated configuration
+  (Base+Attn and MP+Attn), a $K{=}20$ row identical to $K{=}10$, and a ``residual
+  $\gamma$'' block that actually varied the point-loss weight. They are replaced by
+  Tab.~4 (retrained runs, 3 seeds where noted).
+\item \textbf{SIP.} Our models never see SIP, so we now evaluate on all 929 images,
+  as the RGB-D methods do: $S_m{=}0.936$, $\mathcal{M}{=}0.027$
+  (3 seeds: $0.935{\pm}0.004$).
+\end{itemize}
+
+\section{Meta-review}
+\rA\ \emph{Clarify the prompt residual and whether it drives the gains.}
+The coefficient $\gamma$ is removed; Eq.~5 is $C_{\textit{final}}{=}C_N{+}C_0$ as
+implemented. Sec.~3.4 gives the actual mechanism: in binary SOD the VLF text
+cross-attention has a single key, so its output is independent of the correlation
+and the visual features (verified: output change exactly $0$). The residual
+restores the gradient to $W_v$ ($0.75$ vs.\ $0$) and to the attention network
+($2.2{\times}10^{-2}$ vs.\ $0$), but in a 3-seed on/off comparison it does
+\emph{not} improve accuracy (Tab.~4). It is no longer claimed as a contribution.
+
+\rA\ \emph{Evaluation consistency.} Every number we report uses one protocol:
+PySODMetrics $S_m$, mean $E_m$ and MAE on continuous maps, and mean per-image
+$F_\beta$ at a fixed, untuned threshold of $0.5$ (Sec.~4.1).
+
+\rA\ \emph{Claims exceed the evidence.} The abstract, contributions, discussion and
+conclusion are rewritten. Seed standard deviations are reported, effects within
+them are described as such, and a limitations paragraph is added.
+
+\section{Reviewer EhUU}
+\rE\ \emph{F/E variants.} Ours: $F_\beta$ at $0.5$, mean $E_m$; the ``calibrated on
+validation'' wording is removed. Competitor rows state their variant (max F, or not
+stated in the source, marked $\dagger$), and the $F_\beta$ column is not bolded since
+variants differ. Our max $F_\beta$/max $E_m$ on SIP are given in the Tab.~2 caption.
+
+\rE\ \emph{Inconsistency of Tabs.~4/5; ``attention benefits every
+architecture''.} Both tables are removed. With the simple decoder the attention
+weights receive no gradient. With the correlation-aware decoder, attention is
+$+0.001$ to $+0.003$ $S_m$ over max (3 seeds), which we describe as close to seed
+variation.
+
+\rE\ \emph{Novelty and MDSAM.} MDSAM is discussed (Sec.~2) and compared (Tab.~1):
+\methodname{} has higher $S_m$ on four of five benchmarks; MDSAM is higher on
+HKU-IS ($0.941$ vs.\ $0.940$) and has lower MAE on four. The ``first to adapt''
+claim is removed.
+
+\rE\ \emph{PASCAL-S.} Added (850 images): $S_m{=}0.896$, the best in Tab.~1.
+
+\section{Reviewer erKd}
+\rK\ \emph{Residual definition.} Eq.~5 now matches the code; see \rA.
+\rE's Eq.~5/$\gamma$ point is answered there too.
+
+\rK\ \emph{Conclusions exceed evidence; AF on SIP.} Over 3 seeds, +AF improves on
+the baseline on DUTS-TE ($0.928$ vs.\ $0.926$) and DUT-OMRON ($0.883$ vs.\ $0.879$)
+and is within one standard deviation on ECSSD, HKU-IS, PASCAL-S and SIP (Tab.~3).
+We state these gains as small and removed ``most impactful component''.
+
+\rK\ \emph{Competitor numbers.} Every competitor value is now traced to a published
+table: Dulam \& Kambhamettu (CVPRW'25) for the classical methods, the STNet paper
+for DC-Net/ADMNet/BDFGNet/STNet, MDSAM's own paper, and VST++ for the RGB-D methods
+on SIP. Submitted values that matched no source are corrected (red in Tab.~1;
+purple in Tab.~2).
+
+\rK\ \emph{Repeated runs.} Three seeds for 7 settings (21 runs; Tabs.~3--4).
+
+\end{document}
