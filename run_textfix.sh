@@ -106,3 +106,5 @@ case "${1:-}" in
     for entry in "${QUEUE[@]}"; do IFS='|' read -r name g flags <<< "$entry"; echo "GPU $g  $name  $flags"; done ;;
   *) echo "Usage: bash run_textfix.sh {launch_all|gpu0..gpu3|dry}"; exit 1 ;;
 esac
+# (2026-11-10) VLF multi-token runs on ours were launched by hand as screens vm_*:
+#   vlfmt_af_s{42,1,2}: $PLUS_AF --vlf-multi-token --vlf-residual ; vlfmt_nores_af_s42: $PLUS_AF --vlf-multi-token
