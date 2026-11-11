@@ -57,6 +57,7 @@
 <polyline points="905,655 905,675 270,675 270,655" fill="none" stroke="#000" stroke-width="2.2" marker-end="url(#ah)" stroke-dasharray="7,5"/>
 <polyline points="1045,600 1235,600 1235,395 1265,395" fill="none" stroke="#000" stroke-width="2.2" marker-end="url(#ah)"/>
 <polyline points="1415,420 1415,475" fill="none" stroke="#000" stroke-width="2.2" marker-end="url(#ah)"/>
+<polyline points="800,410 800,530" fill="none" stroke="#000" stroke-width="2.2" marker-end="url(#ah)"/>
 <text x="160" y="60" text-anchor="middle" font-size="22" fill="#000000" font-weight="bold">Input image</text>
 <text x="1415" y="668" text-anchor="middle" font-size="20" fill="#000000" font-weight="bold">Predicted saliency mask</text>
 <text x="1415" y="692" text-anchor="middle" font-size="15" fill="#000000">M (1 × H × W)</text>
@@ -69,5 +70,7 @@
 <text x="1125" y="583" text-anchor="middle" font-size="13" fill="#404040">refined Fᵥ</text>
 <text x="1125" y="620" text-anchor="middle" font-size="12" fill="#404040">(after N blocks)</text>
 <text x="125" y="745" text-anchor="start" font-size="15" fill="#000000">Components we add to ESC-Net</text>
+<text x="808" y="497" text-anchor="start" font-size="13" fill="#404040">caption embedding</text>
+<text x="808" y="514" text-anchor="start" font-size="12" fill="#404040">(single text token)</text>
 <polygon fill="#000" points="110.0,728.0 112.7,735.3 120.5,735.6 114.4,740.4 116.5,747.9 110.0,743.6 103.5,747.9 105.6,740.4 99.5,735.6 107.3,735.3"/>
 </svg>

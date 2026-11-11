@@ -60,6 +60,8 @@ LABELS = [  # (x, y, text, size, bold, anchor, color)
     (1125, 583, 'refined F_v', 13, False, 'middle', '#404040'),
     (1125, 620, '(after N blocks)', 12, False, 'middle', '#404040'),
     (125, 745, 'Components we add to ESC-Net', 15, False, 'start', '#000000'),
+    (808, 497, 'caption embedding', 13, False, 'start', '#404040'),
+    (808, 514, '(single text token)', 12, False, 'start', '#404040'),
 ]
 ARROWS = [  # (points, dashed)
     ([(300, 168), (330, 168)], False),                      # image -> ViT
@@ -75,6 +77,7 @@ ARROWS = [  # (points, dashed)
     ([(905, 655), (905, 675), (270, 675), (270, 655)], True),    # VLF -> next PPG
     ([(1045, 600), (1235, 600), (1235, 395), (1265, 395)], False),  # refined F_v -> decoder
     ([(1415, 420), (1415, 475)], False),                    # decoder -> mask
+    ([(800, 410), (800, 530)], False),                      # caption embedding -> VLF
 ]
 
 
