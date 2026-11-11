@@ -3,10 +3,10 @@
   \centering
   \caption{SIP (all 929 images): \methodname{} (RGB only, trained on DUTS-TR) vs.\
     RGB-D methods (RGB{+}depth, trained on RGB-D data). \rev{RGB-D values are from
-    VST++~\cite{vstpp2024} (max $F_\beta$, max $E_m$); ours are $F_\beta$ at threshold
+    VST++~\cite{vstpp2024} (max $F_\beta$, max $E_m$); \methodname{} values are $F_\beta$ at threshold
     $0.5$ and mean $E_m$ (our max $F_\beta$/max $E_m$: .947/.969).
     Three seeds: $S_m$ .935$\pm$0.004, $\mathcal{M}$ .028$\pm$0.002.
-    Purple: changed from the submitted version; please verify.}}
+    Best per column in \textbf{bold}. Purple: changed from the submitted version; please verify.}}
   \label{tab:sip_rgbd}
   \setlength{\tabcolsep}{4pt}
   \footnotesize
@@ -22,7 +22,7 @@
     VST~\cite{vst2021} & RGB-D & .904 & \chk{.915} & .944 & .040 \\
     EBMGSOD~\cite{sod_ebm} & RGB-D & .902 & \chk{.918} & \chk{.944} & .037 \\
     \midrule
-    \methodname{} (ours) & RGB & \rev{\textbf{.936}} & \rev{\textbf{.937}} & \rev{\textbf{.958}} & \rev{\textbf{.027}} \\
+    \methodname{} & RGB & \rev{\textbf{.936}} & \rev{\textbf{.937}} & \rev{\textbf{.958}} & \rev{\textbf{.027}} \\
     \bottomrule
   \end{tabular}
 \end{table}

@@ -2,7 +2,7 @@
 \begin{table*}[t]
   \centering
   \begin{revpar}
-  \caption{Prompt-side adaptations, all with the simple decoder and BCE loss. Runs: number of seeds (42, 1, 2); multi-seed entries are mean$\pm$std. $\overline{\mathcal{M}}$: MAE averaged over the six benchmarks. MP: 10-prompt bank with max aggregation; AF: adaptive fallback; VLF-$K$: fusion block attends over the $K$ bank prompts and the caption. \textbf{Ours} = MP+AF.}
+  \caption{Prompt-side adaptations, all with the simple decoder and BCE loss. Runs: number of seeds (42, 1, 2); multi-seed entries are mean$\pm$std. $\overline{\mathcal{M}}$: MAE averaged over the six benchmarks. MP: 10-prompt bank with max aggregation; AF: adaptive fallback; VLF-$K$: fusion block attends over the $K$ bank prompts and the caption. \methodname{} = MP+AF. Best per column in \textbf{bold} (means for multi-seed rows).}
   \label{tab:prompt_side}
   \setlength{\tabcolsep}{3.2pt}
   \footnotesize
@@ -14,16 +14,16 @@
     \midrule
     Baseline (single prompt) & 3 & .926{\scriptsize$\pm$.000} & .879{\scriptsize$\pm$.002} & .950{\scriptsize$\pm$.001} & .940{\scriptsize$\pm$.001} & .897{\scriptsize$\pm$.002} & .933{\scriptsize$\pm$.003} & .034 \\
     + AF & 1 & .925 & .880 & .951 & .940 & .898 & .931 & .034 \\
-    + MP & 1 & .926 & .885 & .951 & .940 & .898 & .931 & .033 \\
-    \textbf{+ MP + AF (ours)} & 3 & .928{\scriptsize$\pm$.001} & .883{\scriptsize$\pm$.002} & .949{\scriptsize$\pm$.000} & .940{\scriptsize$\pm$.000} & .897{\scriptsize$\pm$.001} & .935{\scriptsize$\pm$.004} & .033 \\
+    + MP & 1 & .926 & \textbf{.885} & .951 & .940 & .898 & .931 & \textbf{.033} \\
+    + MP + AF (\methodname{}) & 3 & \textbf{.928}{\scriptsize$\pm$.001} & .883{\scriptsize$\pm$.002} & .949{\scriptsize$\pm$.000} & .940{\scriptsize$\pm$.000} & .897{\scriptsize$\pm$.001} & .935{\scriptsize$\pm$.004} & \textbf{.033} \\
     \midrule
-    Ours, $K{=}1$ & 1 & .927 & .880 & .952 & .941 & .897 & .938 & .033 \\
-    Ours, $K{=}5$ & 1 & .927 & .881 & .950 & .940 & .899 & .934 & .033 \\
-    Ours, random wording & 1 & .923 & .876 & .952 & .940 & .896 & .935 & .035 \\
-    Ours, diverse wording & 1 & .926 & .883 & .951 & .941 & .898 & .933 & .033 \\
+    \methodname{}, $K{=}1$ & 1 & .927 & .880 & \textbf{.952} & \textbf{.941} & .897 & \textbf{.938} & \textbf{.033} \\
+    \methodname{}, $K{=}5$ & 1 & .927 & .881 & .950 & .940 & \textbf{.899} & .934 & \textbf{.033} \\
+    \methodname{}, random wording & 1 & .923 & .876 & \textbf{.952} & .940 & .896 & .935 & .035 \\
+    \methodname{}, diverse wording & 1 & .926 & .883 & .951 & \textbf{.941} & .898 & .933 & \textbf{.033} \\
     \midrule
-    Ours + VLF-$K$ & 3 & .925{\scriptsize$\pm$.003} & .877{\scriptsize$\pm$.005} & .949{\scriptsize$\pm$.000} & .940{\scriptsize$\pm$.001} & .897{\scriptsize$\pm$.001} & .933{\scriptsize$\pm$.002} & .035 \\
-    Ours + VLF-$K$, no in-block residual & 1 & .926 & .879 & .948 & .939 & .897 & .934 & .033 \\
+    \methodname{} + VLF-$K$ & 3 & .925{\scriptsize$\pm$.003} & .877{\scriptsize$\pm$.005} & .949{\scriptsize$\pm$.000} & .940{\scriptsize$\pm$.001} & .897{\scriptsize$\pm$.001} & .933{\scriptsize$\pm$.002} & .035 \\
+    \methodname{} + VLF-$K$, no in-block residual & 1 & .926 & .879 & .948 & .939 & .897 & .934 & \textbf{.033} \\
     \bottomrule
   \end{tabular}
   \end{revpar}

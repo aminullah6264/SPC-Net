@@ -1,31 +1,39 @@
 \documentclass[10pt,twocolumn,letterpaper]{article}
 
-\usepackage[review,algorithms]{wacv}
+%%%%%%%%% PAPER TYPE: camera-ready
+% \usepackage[review,algorithms]{wacv}   % review version (submitted)
+\usepackage{wacv}                          % camera-ready version
 
 \input{preamble}
-% Camera-ready markup: red = changed after review, purple = co-authors please verify
-\newcommand{\rev}[1]{{\color{red}#1}}
-\newcommand{\chk}[1]{{\color{purple}#1}}
-\newenvironment{revpar}{\color{red}}{}
+
+% Change markup for co-authors: red = changed after review, purple = please verify.
+% Set \markupfalse before the final upload to print everything in black.
+\newif\ifmarkup
+\markuptrue
+\newcommand{\rev}[1]{\ifmarkup{\color{red}#1}\else#1\fi}
+\newcommand{\chk}[1]{\ifmarkup{\color{purple}#1}\else#1\fi}
+\newenvironment{revpar}{\ifmarkup\color{red}\fi}{}
 
 \definecolor{wacvblue}{rgb}{0.21,0.49,0.74}
 \usepackage[pagebackref,breaklinks,colorlinks,allcolors=wacvblue]{hyperref}
 
-\def\wacvPaperID{}
+%%%%%%%%% PAPER ID (LVR workshop submission)
+\def\wacvPaperID{3}
 \def\confName{WACV}
 \def\confYear{2027}
 
 \title{\methodname: Salient Prompt Combination for Foundation-Model Salient Object Detection}
 
-\author{First Author\\
-Institution1\\
-Institution1 address\\
-{\tt\small firstauthor@i1.org}
-\and
-Second Author\\
-Institution2\\
-First line of institution2 address\\
-{\tt\small secondauthor@i2.org}
+\author{
+Muhammad Abbas$^{1}$\quad
+Mohammad Farhad Bulbul$^{2}$\quad
+Tanveer Hussain$^{3}$\quad
+Amin Ullah$^{4}$\\[4pt]
+$^{1}$Bacha Khan University Charsadda\quad
+$^{2}$Jashore University of Science and Technology\\
+$^{3}$Edge Hill University\quad
+$^{4}$Boeing\\[2pt]
+{\tt\small mabbaskhan771@gmail.com, farhad@just.edu.bd, hussaint@edgehill.ac.uk, amin.ullah@boeing.com}
 }
 
 \begin{document}

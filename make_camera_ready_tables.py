@@ -72,10 +72,12 @@ def table1():
     allrows = [r[3] for r in COMP] + [ours]
     best_sm = [max(round(r[i][0], 3) for r in allrows) for i in range(5)]
     best_mae = [min(round(r[i][2], 3) for r in allrows) for i in range(5)]
+    best_f = [max(round(r[i][1], 3) for r in allrows) for i in range(5)]
 
     def cell(v, i, k, changed):
         s = f3(v)
-        if (k == 0 and round(v, 3) == best_sm[i]) or (k == 2 and round(v, 3) == best_mae[i]):
+        if ((k == 0 and round(v, 3) == best_sm[i]) or (k == 1 and round(v, 3) == best_f[i])
+                or (k == 2 and round(v, 3) == best_mae[i])):
             s = f'\\textbf{{{s}}}'
         return f'\\rev{{{s}}}' if changed else s
 
@@ -99,11 +101,10 @@ def table1():
     body = '\n'.join(L)
     return f"""\\begin{{table*}}[t]
   \\centering
-  \\caption{{Comparison with RGB SOD methods. Best $S_m$ and $\\mathcal{{M}}$ per column in
-    \\textbf{{bold}}. \\rev{{Competitor values are taken from published tables (see text);
+  \\caption{{Comparison with RGB SOD methods. Best result per column in \\textbf{{bold}}. \\rev{{Competitor values are taken from published tables (see text);
     their $F_\\beta$ is the maximum F-measure, or a variant not stated in the source
-    ($^\\dagger$), while ours is $F_\\beta$ at a fixed threshold of $0.5$, so the
-    $F_\\beta$ column is not directly comparable and is not bolded. \\methodname{{}}:
+    ($^\\dagger$), while \\methodname{{}} uses $F_\\beta$ at a fixed threshold of $0.5$, so the
+    $F_\\beta$ column is not directly comparable. \\methodname{{}}:
     Baseline+MP+AF, CLIP ViT-L/14 at $336^2$, seed 42; three-seed means are in
     \\cref{{tab:prompt_side}}.}}}}
   \\label{{tab:sota}}
@@ -120,7 +121,7 @@ def table1():
     \\midrule
 {body}
     \\midrule
-    \\methodname{{}} (ours) & {' & '.join(oc)} \\\\
+    \\methodname{{}} & {' & '.join(oc)} \\\\
     \\bottomrule
   \\end{{tabular}}
 \\end{{table*}}
@@ -141,27 +142,32 @@ SIPC = [
 
 
 def table2():
+    o = J[OURS]['SIP-full']
+    ov = (o['Sm'], o['F05'], o['meanE'], o['MAE'])
+    allv = [r[2] for r in SIPC] + [ov]
+    best = [max(round(r[i], 3) for r in allv) for i in range(3)] + [min(round(r[3], 3) for r in allv)]
+    isb = lambda x, i: round(x, 3) == best[i]
     L = []
     for name, key, v, sub in SIPC:
         if sub is None:
-            cells = [f'\\rev{{{f3(x)}}}' for x in v]
+            cells = [f'\\rev{{{bold(f3(x), isb(x, i))}}}' for i, x in enumerate(v)]
             label = f'\\rev{{{name}~\\cite{{{key}}}}}'
         else:
-            cells = [f3(x) if abs(x - y) < 1e-9 else f'\\chk{{{f3(x)}}}' for x, y in zip(v, sub)]
+            cells = [bold(f3(x), isb(x, i)) if abs(x - y) < 1e-9 else f'\\chk{{{bold(f3(x), isb(x, i))}}}'
+                     for i, (x, y) in enumerate(zip(v, sub))]
             label = f'{name}~\\cite{{{key}}}'
         L.append(f'    {label} & RGB-D & ' + ' & '.join(cells) + ' \\\\')
-    o = J[OURS]['SIP-full']
     m_sm, s_sm = ms('plus_af', 'SIP-full', 'Sm')
     m_mae, s_mae = ms('plus_af', 'SIP-full', 'MAE')
-    ours = ' & '.join(f'\\rev{{\\textbf{{{f3(o[k])}}}}}' for k in ('Sm', 'F05', 'meanE', 'MAE'))
+    ours = ' & '.join(f'\\rev{{{bold(f3(x), isb(x, i))}}}' for i, x in enumerate(ov))
     return f"""\\begin{{table}}[t]
   \\centering
   \\caption{{SIP (all 929 images): \\methodname{{}} (RGB only, trained on DUTS-TR) vs.\\
     RGB-D methods (RGB{{+}}depth, trained on RGB-D data). \\rev{{RGB-D values are from
-    VST++~\\cite{{vstpp2024}} (max $F_\\beta$, max $E_m$); ours are $F_\\beta$ at threshold
+    VST++~\\cite{{vstpp2024}} (max $F_\\beta$, max $E_m$); \\methodname{{}} values are $F_\\beta$ at threshold
     $0.5$ and mean $E_m$ (our max $F_\\beta$/max $E_m$: {f3(o['maxF'])}/{f3(o['maxE'])}).
     Three seeds: $S_m$ {f3(m_sm)}$\\pm${s_sm:.3f}, $\\mathcal{{M}}$ {f3(m_mae)}$\\pm${s_mae:.3f}.
-    Purple: changed from the submitted version; please verify.}}}}
+    Best per column in \\textbf{{bold}}. Purple: changed from the submitted version; please verify.}}}}
   \\label{{tab:sip_rgbd}}
   \\setlength{{\\tabcolsep}}{{4pt}}
   \\footnotesize
@@ -171,7 +177,7 @@ def table2():
     \\midrule
 {chr(10).join(L)}
     \\midrule
-    \\methodname{{}} (ours) & RGB & {ours} \\\\
+    \\methodname{{}} & RGB & {ours} \\\\
     \\bottomrule
   \\end{{tabular}}
 \\end{{table}}
@@ -183,25 +189,40 @@ def seeds_of(spec):
     return spec if isinstance(spec, list) else [spec]
 
 
-def study_row(label, spec, ref=None):
+def study_stats(label, spec):
     vs = seeds_of(spec)
-    c = []
+    cols = []
     for d in D6:
-        a = [J[v][d]['Sm'] for v in vs]
-        c.append(pm(st.mean(a), st.stdev(a)) if len(a) > 1 else f3(a[0]))
+        x = [J[v][d]['Sm'] for v in vs]
+        cols.append((st.mean(x), st.stdev(x) if len(x) > 1 else None))
     mae = st.mean(st.mean(J[v][d]['MAE'] for d in D6) for v in vs)
-    return f'    {label} & {len(vs)} & ' + ' & '.join(c) + f' & {f3(mae)} \\\\'
+    return label, len(vs), cols, mae
+
+
+def bold(s, on):
+    return f'\\textbf{{{s}}}' if on else s
 
 
 S3 = lambda b: [f'{b}_s{s}' for s in (42, 1, 2)]
 
 
 def study_table(label, caption, groups):
+    stats = [[study_stats(*r) for r in rows] for rows in groups]
+    flat = [r for g in stats for r in g]
+    best = [max(round(r[2][i][0], 3) for r in flat) for i in range(len(D6))]
+    best_mae = min(round(r[3], 3) for r in flat)
     body = []
-    for gi, rows in enumerate(groups):
+    for gi, rows in enumerate(stats):
         if gi:
             body.append('    \\midrule')
-        body += [study_row(*r) for r in rows]
+        for lab, n, cols, mae in rows:
+            c = []
+            for i, (m, sd) in enumerate(cols):
+                txt = bold(f3(m), round(m, 3) == best[i])
+                if sd is not None:
+                    txt += f'{{\\scriptsize$\\pm${sd:.3f}'.replace('0.', '.', 1) + '}'
+                c.append(txt)
+            body.append(f'    {lab} & {n} & ' + ' & '.join(c) + f' & {bold(f3(mae), round(mae, 3) == best_mae)} \\\\')
     return f"""\\begin{{table*}}[t]
   \\centering
   \\begin{{revpar}}
@@ -229,36 +250,36 @@ def table3():
            "$\\overline{\\mathcal{M}}$: MAE averaged over the six benchmarks. "
            "MP: 10-prompt bank with max aggregation; AF: adaptive fallback; "
            "VLF-$K$: fusion block attends over the $K$ bank prompts and the caption. "
-           "\\textbf{Ours} = MP+AF.")
+           "\\methodname{} = MP+AF. Best per column in \\textbf{bold} (means for multi-seed rows).")
     return study_table('tab:prompt_side', cap, [
         [('Baseline (single prompt)', S3('baseline')),
          ('+ AF', 'base_af_s42'),
          ('+ MP', 'plus_mp_s42'),
-         ('\\textbf{+ MP + AF (ours)}', S3('plus_af'))],
-        [('Ours, $K{=}1$', 'af_K1_s42'),
-         ('Ours, $K{=}5$', 'af_K5_s42'),
-         ('Ours, random wording', 'af_random_s42'),
-         ('Ours, diverse wording', 'af_diverse_s42')],
-        [('Ours + VLF-$K$', S3('vlfmt_af')),
-         ('Ours + VLF-$K$, no in-block residual', 'vlfmt_nores_af_s42')],
+         ('+ MP + AF (\\methodname{})', S3('plus_af'))],
+        [('\\methodname{}, $K{=}1$', 'af_K1_s42'),
+         ('\\methodname{}, $K{=}5$', 'af_K5_s42'),
+         ('\\methodname{}, random wording', 'af_random_s42'),
+         ('\\methodname{}, diverse wording', 'af_diverse_s42')],
+        [('\\methodname{} + VLF-$K$', S3('vlfmt_af')),
+         ('\\methodname{} + VLF-$K$, no in-block residual', 'vlfmt_nores_af_s42')],
     ])
 
 
 def table4():
-    cap = ("Architecture and training adaptations. ``Corr-aware'': ours + bidirectional "
+    cap = ("Architecture and training adaptations. ``Corr-aware'': \\methodname{} + bidirectional "
            "SAM attention, ASPP/FPN decoder that reads the correlation, compound loss and "
            "deep supervision. Residual: $C_{\\textit{final}}{=}C_N{+}C_0$ "
            "(\\cref{eq:residual}). Frozen: CLIP visual encoder and SAM blocks frozen, new "
            "modules trained. Columns as in \\cref{tab:prompt_side}.")
     return study_table('tab:arch_side', cap, [
-        [('\\textbf{Ours} (simple decoder, BCE)', S3('plus_af')),
-         ('Ours + BiSAM', 'plus_bisam_s42')],
+        [('\\methodname{} (simple decoder, BCE)', S3('plus_af')),
+         ('\\methodname{} + BiSAM', 'plus_bisam_s42')],
         [('Corr-aware, max, residual on', ['plus_dec_s42', 'dec_max_s1', 'dec_max_s2']),
          ('Corr-aware, max, residual off', S3('dec_max_noresid')),
          ('Corr-aware, attention, residual on', S3('dec_attention')),
          ('Corr-aware, attention, residual off', S3('dec_attention_noresid')),
          ('Corr-aware, max, residual on, + point loss', S3('full_max'))],
-        [('Ours, frozen encoders', S3('frozen_plus_af'))],
+        [('\\methodname{}, frozen encoders', S3('frozen_plus_af'))],
     ])
 
 
