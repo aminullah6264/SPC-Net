@@ -35,20 +35,23 @@ the paper). Code and per-run metrics will be released.
 \begin{itemize}\itemsep0pt
 \item \textbf{Text encoder.} Our implementation bypassed the CLIP text transformer,
   so each prompt embedding depended only on its token length. We fixed this and
-  \emph{retrained all reported models} (29 runs) with the frozen CLIP text encoder
-  (Sec.~3.2). The main results changed by at most $0.003$ $S_m$.
+  \emph{retrained all reported models} (Sec.~3.2); the main results changed by at
+  most $0.3$ $S_m$ points.
 \item \textbf{Fine-tuning.} The paper stated that CLIP and SAM were frozen except
   $W_v$. In fact the CLIP visual encoder is fine-tuned (attention layers and SAM
   blocks at $2{\times}10^{-6}$, other layers and new modules at $2{\times}10^{-5}$).
-  Sec.~4.2 now says so, and a new frozen-encoder ablation (3 seeds) shows freezing
-  costs $0.008$--$0.044$ $S_m$ (Tab.~3).
-\item \textbf{Reported configuration.} The reported model (Baseline+MP+AF) uses a
-  U-Net decoder, BCE loss and max aggregation; Secs.~3.1--3.7 now describe it and
-  the correlation-aware variant separately.
-\item \textbf{Tables 4--6 of the submission} contained a duplicated configuration
-  (Base+Attn and MP+Attn), a $K{=}20$ row identical to $K{=}10$, and a ``residual
-  $\gamma$'' block that actually varied the point-loss weight. They are replaced by
-  Tab.~4 (retrained runs, 3 seeds where noted).
+  Sec.~4.2 now says so. The reported model uses a U-Net decoder, BCE and max
+  aggregation, as Sec.~3 now states.
+\item \textbf{Framing.} Our matched experiments show that the proposed prompt-side
+  components give small gains ($+0.2$/$+0.3$ $S_m$ points on DUTS-TE/DUT-OMRON over a
+  single-prompt baseline, 3 seeds) and that encoder fine-tuning dominates
+  ($+0.8$--$4.4$ points over frozen encoders). We therefore present the paper as a
+  model plus a controlled comparative study of adaptation choices (Secs.~1, 4.4--4.6);
+  the point loss is removed from the method, and the residual and attention are
+  reported as studied alternatives. Eq.~5 is now Eq.~4.
+\item \textbf{Submitted Tabs.~4--6} had a duplicated configuration, a $K{=}20$ row
+  equal to $K{=}10$, and a ``$\gamma$'' block that varied the point-loss weight. They
+  are replaced by Tabs.~3--4.
 \item \textbf{SIP.} Our models never see SIP, so we now evaluate on all 929 images,
   as the RGB-D methods do: $S_m{=}0.936$, $\mathcal{M}{=}0.027$
   (3 seeds: $0.935{\pm}0.004$).
@@ -56,21 +59,20 @@ the paper). Code and per-run metrics will be released.
 
 \section{Meta-review}
 \rA\ \emph{Clarify the prompt residual and whether it drives the gains.}
-The coefficient $\gamma$ is removed; Eq.~5 is $C_{\textit{final}}{=}C_N{+}C_0$ as
+The coefficient $\gamma$ is removed; Eq.~4 is $C_{\textit{final}}{=}C_N{+}C_0$ as
 implemented. Sec.~3.4 gives the actual mechanism: in binary SOD the VLF text
 cross-attention has a single key, so its output is independent of the correlation
 and the visual features (verified: output change exactly $0$). The residual
-restores the gradient to $W_v$ ($0.75$ vs.\ $0$) and to the attention network
-($2.2{\times}10^{-2}$ vs.\ $0$), but in a 3-seed on/off comparison it does
-\emph{not} improve accuracy (Tab.~4). It is no longer claimed as a contribution.
+restores the gradient to $W_v$ ($0.75$ vs.\ $0$), but in 3-seed on/off comparisons it
+changes $S_m$ by at most $0.4$ points with no consistent sign (Tab.~4). It is
+reported as a studied alternative, not a contribution.
 
 \rA\ \emph{Evaluation consistency.} Every number we report uses one protocol:
 PySODMetrics $S_m$, mean $E_m$ and MAE on continuous maps, and mean per-image
 $F_\beta$ at a fixed, untuned threshold of $0.5$ (Sec.~4.1).
 
-\rA\ \emph{Claims exceed the evidence.} The abstract, contributions, discussion and
-conclusion are rewritten. Seed standard deviations are reported, effects within
-them are described as such, and a limitations paragraph is added.
+\rA\ \emph{Claims exceed the evidence.} Claims are rewritten throughout; seed
+standard deviations and a limitations paragraph are added.
 
 \section{Reviewer EhUU}
 \rE\ \emph{F/E variants.} Ours: $F_\beta$ at $0.5$, mean $E_m$; the ``calibrated on
@@ -80,9 +82,8 @@ variants differ. Our max $F_\beta$/max $E_m$ on SIP are given in the Tab.~2 capt
 
 \rE\ \emph{Inconsistency of Tabs.~4/5; ``attention benefits every
 architecture''.} Both tables are removed. With the simple decoder the attention
-weights receive no gradient. With the correlation-aware decoder, attention is
-$+0.001$ to $+0.003$ $S_m$ over max (3 seeds), which we describe as close to seed
-variation.
+weights receive no gradient. In the correlation-aware variant (3 seeds) attention is
+not better than max-pooling (Tab.~4).
 
 \rE\ \emph{Novelty and MDSAM.} MDSAM is discussed (Sec.~2) and compared (Tab.~1):
 \methodname{} has higher $S_m$ on four of five benchmarks; MDSAM is higher on
@@ -97,8 +98,9 @@ claim is removed.
 
 \rK\ \emph{Conclusions exceed evidence; AF on SIP.} Over 3 seeds, +AF improves on
 the baseline on DUTS-TE ($0.928$ vs.\ $0.926$) and DUT-OMRON ($0.883$ vs.\ $0.879$)
-and is within one standard deviation on ECSSD, HKU-IS, PASCAL-S and SIP (Tab.~3).
-We state these gains as small and removed ``most impactful component''.
+and is within one standard deviation on ECSSD, HKU-IS, PASCAL-S and SIP (Tab.~3);
+neither the bank nor the fallback helps alone. We state these gains as small and
+removed ``most impactful component''.
 
 \rK\ \emph{Competitor numbers.} Every competitor value is now traced to a published
 table: Dulam \& Kambhamettu (CVPRW'25) for the classical methods, the STNet paper
@@ -106,6 +108,6 @@ for DC-Net/ADMNet/BDFGNet/STNet, MDSAM's own paper, and VST++ for the RGB-D meth
 on SIP. Submitted values that matched no source are corrected (red in Tab.~1;
 purple in Tab.~2).
 
-\rK\ \emph{Repeated runs.} Three seeds for 7 settings (21 runs; Tabs.~3--4).
+\rK\ \emph{Repeated runs.} Three seeds for 10 settings (Tabs.~3--4).
 
 \end{document}

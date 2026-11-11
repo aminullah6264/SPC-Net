@@ -45,62 +45,50 @@ number of trainable fusion parameters. This raises a natural question:
 \emph{can the SAM--CLIP correlation paradigm be adapted to give SOD the same
 foundation-model benefits?}
 
-The adaptation is not trivial. Open-vocabulary segmenters are designed for
-multi-class recognition: each class contributes its own text prompt, and the
-correlation map is naturally aligned to a specific semantic label. SOD is
-class-agnostic and binary: there is no fixed class to prompt. A naive port that
-uses a single generic prompt such as ``a salient object'' aligns poorly with the
-enormous appearance diversity of salient objects and collapses for small or
-low-contrast targets, producing empty or diffuse correlation maps that in turn
-yield degenerate SAM prompts. The pseudo-prompt generator that converts the
-correlation into SAM inputs is especially brittle: after a spatial softmax the map
-is nearly uniform, so a fixed threshold routinely produces an empty prompt set and
-starves the SAM decoder of spatial guidance. A coarse, multi-class-style decoder
-compounds the problem by discarding the fine detail that SOD demands.
+\begin{revpar}
+The adaptation raises several design questions. Open-vocabulary segmenters are
+built for multi-class recognition, where each class contributes its own text
+prompt; SOD is class-agnostic and binary, so it is unclear how the text side
+should be designed. A single generic prompt such as ``a salient object'' may
+cover only part of the appearance range of salient objects, which motivates a
+bank of prompts, but it is not known how large the bank should be, how its
+correlation maps should be aggregated, or whether the wording matters. The
+pseudo-prompt generator that turns the correlation into SAM inputs can return an
+empty prompt set when the map is diffuse. Further choices concern how the
+correlation reaches the decoder, which decoder and loss to use, and whether the
+CLIP encoder should be adapted at all. Each of these choices is plausible, but
+their individual effects on SOD have not been measured under a common protocol.
 
-%% OLD (submitted): "We investigate what it takes to make this adaptation work, and
-%% reach a perhaps surprising conclusion: the dominant factor is ... the gradient
-%% path ... Stacking multiple ESC blocks progressively overwrites the initial prompt
-%% correlation ... A prompt-residual connection ... restores this signal, and only
-%% then does the prompt mechanism pay off. ... a plain U-Net decoder outperforms the
-%% complex ASPP/FPN decoder and the auxiliary point-classification loss ..."
-\rev{We investigate what it takes to make this adaptation work. With a CLIP
-ViT-L/14 backbone, a prompt bank, and a pseudo-prompt generator that never returns
-an empty prompt set, a simple configuration (U-Net decoder, binary cross-entropy)
-reaches strong results on all benchmarks, and adding a correlation-aware ASPP/FPN
-decoder or an auxiliary point-classification loss does not improve S-measure on
-the primary benchmark. We also examine how the prompt-derived correlation reaches
-the loss. In the binary setting the text cross-attention inside the fusion block
-has a single key, so its output does not depend on its inputs; the prompt branch
-then receives gradient only through a residual that adds the initial correlation
-back before decoding. In matched
-experiments this residual does not improve accuracy, and repeated runs show that
-several component differences are within seed-to-seed variance. By contrast,
-fine-tuning the CLIP visual encoder matters a great deal: freezing it lowers
-S-measure by $0.024$ on DUTS-TE and $0.044$ on DUT-OMRON. }
+In this paper we answer these questions with a controlled comparative study. We
+build \methodname{}, a SAM--CLIP model for SOD with a CLIP ViT-L/14 encoder, a
+10-prompt bank, and a pseudo-prompt generator with an adaptive fallback, and we
+compare it against a single-prompt baseline and a set of alternatives on six
+benchmarks under one evaluation protocol, with three training seeds for the main
+comparisons. The results are clear about what matters. Fine-tuning the CLIP
+visual encoder improves S-measure by $0.8$--$4.4$ points over frozen encoders. The
+prompt bank with adaptive fallback adds $0.2$ and $0.3$ points on the two hardest
+benchmarks, DUTS-TE and DUT-OMRON, and is on par elsewhere. Bank size, prompt
+wording, attention-based aggregation, a prompt-residual connection, multi-token
+text fusion, and a correlation-aware decoder have no consistent effect, and an
+auxiliary point-classification loss hurts. We also identify a silent failure mode
+of the binary setting: with a single text token, the text cross-attention of the
+fusion block returns the same output for every input.
+\end{revpar}
 
-%% OLD (submitted) contributions: (1) prompt-residual correlation architecture ...
-%% "without this residual, the VLF blocks completely overwrite the prompt-derived
-%% spatial prior"; (2) learned prompt-attention aggregation ... "improving S-measure
-%% on the challenging SIP benchmark"; (3) adaptive-fallback PPG ... "the single most
-%% impactful component in our ablation"; plus "a comprehensive analysis ...".
-\rev{\noindent\textbf{Contributions.}
+\begin{revpar}
+\noindent\textbf{Contributions.}
 \begin{itemize}
-  \item An adaptation of the SAM--CLIP correlation paradigm to binary SOD with a
-    CLIP ViT-L/14 backbone, a fixed bank of $K{=}10$ salient-object prompts, and an
-    \emph{adaptive-fallback pseudo-prompt generator} that guarantees non-empty
-    spatial guidance for SAM. Among the compared methods it obtains the best
-    S-measure on four of five RGB benchmarks and, with RGB input only, outperforms
-    the listed RGB-D methods on SIP.
-  \item A \emph{diagnostic analysis of the prompt gradient path}: we show that the
-    single-key text cross-attention of the fusion block makes its output
-    independent of the correlation, measure the gradient reaching the prompt branch
-    with and without a prompt-residual connection, and report a matched comparison
-    showing that the residual restores the gradient but does not improve accuracy.
-  \item An analysis of prompt aggregation and bank design over repeated runs:
-    with the full CLIP text encoder, max-pooling and learned per-pixel attention,
-    bank sizes $K\in\{1,5,10\}$, and three prompt-wording strategies differ by at
-    most $0.006$ S-measure on the RGB benchmarks ($0.010$ on SIP), while fine-tuning
-    the CLIP visual encoder is essential (freezing it costs up to $0.044$
-    S-measure).
-\end{itemize}}
+  \item \methodname{}, an adaptation of the SAM--CLIP correlation paradigm to binary
+    SOD. With RGB input only, it obtains the best S-measure among the compared
+    methods on four of five RGB benchmarks and outperforms recent RGB-D methods on
+    SIP.
+  \item A controlled comparative study of the adaptation choices on the text side
+    (bank size, wording, aggregation, multi-token fusion), the architecture side
+    (prompt residual, SAM attention, decoder, loss), and encoder adaptation, on six
+    benchmarks with repeated runs.
+  \item Practical findings: encoder adaptation dominates, the prompt-side
+    components give small gains on the hardest benchmarks, several common design
+    choices are unnecessary, and a single-token fusion block silently ignores its
+    inputs, which a simple input-sensitivity test detects.
+\end{itemize}
+\end{revpar}

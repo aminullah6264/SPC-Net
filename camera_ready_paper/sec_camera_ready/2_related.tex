@@ -43,8 +43,8 @@ labels directly from CLIP~\cite{zhou2022maskclip}, adapt CLIP with mask
 proposals~\cite{liang2023ovseg}, or attach lightweight side
 adapters~\cite{xu2023sanlang}. All of these target multi-class recognition;
 \methodname{} adapts the SAM--CLIP correlation paradigm to class-agnostic binary
-SOD, \rev{and analyses the gradient path from the prompt-derived correlation to the
-loss in this setting.}
+SOD, \rev{and measures which of the adaptation choices this requires actually
+matter.}
 %% OLD: "is, to our knowledge, the first to adapt ... and it identifies and fixes the
 %% gradient-flow issue that arises when the correlation is iteratively refined."
 
@@ -56,9 +56,9 @@ the input image to improve generalisation to unseen classes. Our prompt bank
 is related but operates differently: instead of learning the prompt tokens, we keep
 a fixed bank of $K$ natural-language salient-object descriptions and \rev{study
 how to \emph{aggregate} their correlation maps (max-pooling or learned per-pixel
-attention). In our experiments (\cref{sec:prompt_analysis}) the specific wording,
-the bank size, and the aggregation mode each change S-measure by at most
-$0.006$ on the RGB benchmarks.}
+attention). In our study (\cref{sec:study_prompt}) the bank size, the wording and
+the aggregation mode have no consistent effect on S-measure once the visual
+encoder is fine-tuned.}
 %% OLD: "Our analysis shows that for SOD the aggregation mechanism matters more than
 %% the specific wording (randomly sampled prompts with learned attention match
 %% carefully curated prompts), which suggests that spatial aggregation, not

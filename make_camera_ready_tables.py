@@ -105,7 +105,7 @@ def table1():
     ($^\\dagger$), while ours is $F_\\beta$ at a fixed threshold of $0.5$, so the
     $F_\\beta$ column is not directly comparable and is not bolded. \\methodname{{}}:
     Baseline+MP+AF, CLIP ViT-L/14 at $336^2$, seed 42; three-seed means are in
-    \\cref{{tab:ablation}}.}}}}
+    \\cref{{tab:prompt_side}}.}}}}
   \\label{{tab:sota}}
   \\setlength{{\\tabcolsep}}{{2.6pt}}
   \\scriptsize
@@ -178,89 +178,91 @@ def table2():
 """
 
 
-# ── Table 3: cumulative ablation (S_m and MAE, 6 datasets) ───────────────────
-def row(label, v, red=True):
-    c = [f3(J[v][d]['Sm']) for d in D6] + [f3(J[v][d]['MAE']) for d in D6]
-    return f'    {label} & ' + ' & '.join(c) + ' \\\\'
+# ── Tables 3/4: comparative study (S_m on 6 benchmarks + mean MAE) ───────────
+def seeds_of(spec):
+    return spec if isinstance(spec, list) else [spec]
 
 
-def row_seeds(label, base):
-    c = [pm(*ms(base, d, 'Sm')) for d in D6] + [f3(ms(base, d, 'MAE')[0]) for d in D6]
-    return f'    {label} & ' + ' & '.join(c) + ' \\\\'
+def study_row(label, spec, ref=None):
+    vs = seeds_of(spec)
+    c = []
+    for d in D6:
+        a = [J[v][d]['Sm'] for v in vs]
+        c.append(pm(st.mean(a), st.stdev(a)) if len(a) > 1 else f3(a[0]))
+    mae = st.mean(st.mean(J[v][d]['MAE'] for d in D6) for v in vs)
+    return f'    {label} & {len(vs)} & ' + ' & '.join(c) + f' & {f3(mae)} \\\\'
+
+
+S3 = lambda b: [f'{b}_s{s}' for s in (42, 1, 2)]
+
+
+def study_table(label, caption, groups):
+    body = []
+    for gi, rows in enumerate(groups):
+        if gi:
+            body.append('    \\midrule')
+        body += [study_row(*r) for r in rows]
+    return f"""\\begin{{table*}}[t]
+  \\centering
+  \\begin{{revpar}}
+  \\caption{{{caption}}}
+  \\label{{{label}}}
+  \\setlength{{\\tabcolsep}}{{3.2pt}}
+  \\footnotesize
+  \\begin{{tabular}}{{lc cccccc c}}
+    \\toprule
+    & & \\multicolumn{{6}}{{c}}{{$S_m\\uparrow$}} & \\\\
+    \\cmidrule(lr){{3-8}}
+    Configuration & Runs & {' & '.join(HDR6)} & $\\overline{{\\mathcal{{M}}}}\\downarrow$ \\\\
+    \\midrule
+{chr(10).join(body)}
+    \\bottomrule
+  \\end{{tabular}}
+  \\end{{revpar}}
+\\end{{table*}}
+"""
 
 
 def table3():
-    rows = [row('Baseline', 'baseline_s42'), row('$+$ MP', 'plus_mp_s42'),
-            row('$+$ AF', 'plus_af_s42'), row('$+$ BiSAM', 'plus_bisam_s42'),
-            row('$+$ Dec', 'plus_dec_s42'), row('$+$ Lpt', 'full_max_s42')]
-    seeds = [row_seeds('Baseline', 'baseline'), row_seeds('$+$ AF', 'plus_af'),
-             row_seeds('$+$ AF, frozen enc.', 'frozen_plus_af')]
-    hdr = ' & '.join(f'\\multicolumn{{1}}{{c}}{{{h}}}' for h in ['DT', 'DO', 'EC', 'HK', 'PS', 'SIP'])
-    return f"""\\begin{{table*}}[t]
-  \\centering
-  \\begin{{revpar}}
-  \\caption{{Cumulative ablation (each row adds one component to the row above).
-    Baseline: CLIP ViT-L/14 + SAM blocks + ESC blocks with the single caption, threshold-only
-    PPG, image-to-token SAM attention, U-Net decoder, BCE loss. MP: 10-prompt bank (max);
-    AF: adaptive fallback; BiSAM: bidirectional SAM attention; Dec: ASPP/FPN decoder with
-    compound loss and deep supervision; Lpt: point loss ($\\gamma_{{\\textit{{pt}}}}{{=}}0.3$).
-    Top: seed 42. Bottom: mean$\\pm$std over seeds 42, 1, 2 ($\\mathcal{{M}}$: mean).
-    ``Frozen enc.'': CLIP visual encoder and SAM blocks frozen.
-    DT/DO/EC/HK/PS: DUTS-TE, DUT-OMRON, ECSSD, HKU-IS, PASCAL-S.}}
-  \\label{{tab:ablation}}
-  \\setlength{{\\tabcolsep}}{{2.4pt}}
-  \\scriptsize
-  \\begin{{tabular}}{{l cccccc cccccc}}
-    \\toprule
-    & \\multicolumn{{6}}{{c}}{{$S_m\\uparrow$}} & \\multicolumn{{6}}{{c}}{{$\\mathcal{{M}}\\downarrow$}} \\\\
-    \\cmidrule(lr){{2-7}}\\cmidrule(lr){{8-13}}
-    Variant & {hdr} & {hdr} \\\\
-    \\midrule
-{chr(10).join(rows)}
-    \\midrule
-{chr(10).join(seeds)}
-    \\bottomrule
-  \\end{{tabular}}
-  \\end{{revpar}}
-\\end{{table*}}
-"""
+    cap = ("Prompt-side adaptations, all with the simple decoder and BCE loss. "
+           "Runs: number of seeds (42, 1, 2); multi-seed entries are mean$\\pm$std. "
+           "$\\overline{\\mathcal{M}}$: MAE averaged over the six benchmarks. "
+           "MP: 10-prompt bank with max aggregation; AF: adaptive fallback; "
+           "VLF-$K$: fusion block attends over the $K$ bank prompts and the caption. "
+           "\\textbf{Ours} = MP+AF.")
+    return study_table('tab:prompt_side', cap, [
+        [('Baseline (single prompt)', S3('baseline')),
+         ('+ AF', 'base_af_s42'),
+         ('+ MP', 'plus_mp_s42'),
+         ('\\textbf{+ MP + AF (ours)}', S3('plus_af'))],
+        [('Ours, $K{=}1$', 'af_K1_s42'),
+         ('Ours, $K{=}5$', 'af_K5_s42'),
+         ('Ours, random wording', 'af_random_s42'),
+         ('Ours, diverse wording', 'af_diverse_s42')],
+        [('Ours + VLF-$K$', S3('vlfmt_af')),
+         ('Ours + VLF-$K$, no in-block residual', 'vlfmt_nores_af_s42')],
+    ])
 
 
-# ── Table 4: prompt-side analysis on the full model (S_m) ────────────────────
 def table4():
-    a = []
-    for agg, lab in (('max', 'Max'), ('attention', 'Attention')):
-        for suf, r in (('', 'on'), ('_noresid', 'off')):
-            base = f'full_{agg}{suf}'
-            a.append(f'    {lab} & {r} & ' + ' & '.join(pm(*ms(base, d, 'Sm')) for d in D6) + ' \\\\')
-    b = []
-    for lab, v in (('$K{=}1$', 'K1_s42'), ('$K{=}5$', 'K5_s42'), ('$K{=}10$, curated', 'full_max_s42'),
-                   ('$K{=}10$, random', 'random_bank_s42'), ('$K{=}10$, diverse', 'diverse_bank_s42')):
-        b.append(f'    \\multicolumn{{2}}{{l}}{{{lab}}} & ' + ' & '.join(f3(J[v][d]['Sm']) for d in D6) + ' \\\\')
-    return f"""\\begin{{table*}}[t]
-  \\centering
-  \\begin{{revpar}}
-  \\caption{{Prompt-side analysis on the correlation-aware (full) model, $S_m$.
-    Top: aggregation mode and prompt residual (\\cref{{eq:residual}}), mean$\\pm$std over
-    seeds 42, 1, 2. Bottom: bank size and wording (max aggregation, residual on, seed 42).}}
-  \\label{{tab:prompt}}
-  \\setlength{{\\tabcolsep}}{{4pt}}
-  \\footnotesize
-  \\begin{{tabular}}{{ll cccccc}}
-    \\toprule
-    Aggregation & Residual & {' & '.join(HDR6)} \\\\
-    \\midrule
-{chr(10).join(a)}
-    \\midrule
-{chr(10).join(b)}
-    \\bottomrule
-  \\end{{tabular}}
-  \\end{{revpar}}
-\\end{{table*}}
-"""
+    cap = ("Architecture and training adaptations. ``Corr-aware'': ours + bidirectional "
+           "SAM attention, ASPP/FPN decoder that reads the correlation, compound loss and "
+           "deep supervision. Residual: $C_{\\textit{final}}{=}C_N{+}C_0$ "
+           "(\\cref{eq:residual}). Frozen: CLIP visual encoder and SAM blocks frozen, new "
+           "modules trained. Columns as in \\cref{tab:prompt_side}.")
+    return study_table('tab:arch_side', cap, [
+        [('\\textbf{Ours} (simple decoder, BCE)', S3('plus_af')),
+         ('Ours + BiSAM', 'plus_bisam_s42')],
+        [('Corr-aware, max, residual on', ['plus_dec_s42', 'dec_max_s1', 'dec_max_s2']),
+         ('Corr-aware, max, residual off', S3('dec_max_noresid')),
+         ('Corr-aware, attention, residual on', S3('dec_attention')),
+         ('Corr-aware, attention, residual off', S3('dec_attention_noresid')),
+         ('Corr-aware, max, residual on, + point loss', S3('full_max'))],
+        [('Ours, frozen encoders', S3('frozen_plus_af'))],
+    ])
 
 
-for name, fn in (('tab_sota', table1), ('tab_sip', table2), ('tab_ablation', table3), ('tab_prompt', table4)):
+for name, fn in (('tab_sota', table1), ('tab_sip', table2), ('tab_prompt_side', table3), ('tab_arch_side', table4)):
     with open(os.path.join(OUT, f'{name}.tex'), 'w') as f:
         f.write('% AUTO-GENERATED by make_camera_ready_tables.py from textfix_numbers.json\n' + fn())
     print('wrote', name)
