@@ -76,19 +76,24 @@ fusion block returns the same output for every input.
 \end{revpar}
 
 \begin{revpar}
-\noindent\textbf{Contributions.}
+\noindent The main contributions of this work are summarised as follows:
 \begin{itemize}
-  \item \methodname{}, an adaptation of the SAM--CLIP correlation paradigm to binary
-    SOD. With RGB input only, it obtains the best S-measure among the compared
-    methods on four of five RGB benchmarks and outperforms recent RGB-D methods on
-    SIP.
-  \item A controlled comparative study of the adaptation choices on the text side
-    (bank size, wording, aggregation, multi-token fusion), the architecture side
-    (prompt residual, SAM attention, decoder, loss), and encoder adaptation, on six
-    benchmarks with repeated runs.
-  \item Practical findings: encoder adaptation dominates, the prompt-side
-    components give small gains on the hardest benchmarks, several common design
-    choices are unnecessary, and a single-token fusion block silently ignores its
-    inputs, which a simple input-sensitivity test detects.
+  \item We conduct, to the best of our knowledge, the first controlled comparative
+    study of how to adapt a SAM--CLIP correlation pipeline to binary SOD. Under a
+    single evaluation protocol on six benchmarks, with three training seeds for the
+    main settings, we compare text-side choices (prompt bank size, wording,
+    aggregation, and multi-token fusion), architectural choices (prompt residual,
+    SAM attention, decoder, and loss), and encoder adaptation.
+  \item We propose \methodname{}, which adapts the SAM--CLIP correlation paradigm to
+    SOD with a fixed salient-object prompt bank and a pseudo-prompt generator with an
+    adaptive fallback that guarantees non-empty prompts for SAM. Using RGB input
+    only, \methodname{} achieves the best S-measure among the compared methods on
+    four of five RGB benchmarks and outperforms recent RGB-D methods on SIP.
+  \item We show that fine-tuning the CLIP visual encoder is the dominant factor
+    ($+0.8$ to $+4.4$ S-measure points over frozen encoders), that the prompt-side
+    components give small gains on the hardest benchmarks, and that several common
+    design choices bring no consistent benefit. We further identify a silent
+    failure mode of the binary setting, in which a single-token fusion block
+    ignores its inputs, and show that a simple input-sensitivity test detects it.
 \end{itemize}
 \end{revpar}
