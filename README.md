@@ -5,6 +5,10 @@ Official code for the paper accepted at the **LVR Workshop @ WACV 2027**.
 Muhammad Abbas¹, Mohammad Farhad Bulbul², Tanveer Hussain³, Amin Ullah⁴
 ¹Bacha Khan University Charsadda · ²Jashore University of Science and Technology · ³Edge Hill University · ⁴The Boeing Company
 
+<p align="center">
+  <img src="tools/SOD_framework.png" alt="SPC-Net framework" width="100%">
+</p>
+
 SPC-Net adapts the SAM–CLIP correlation paradigm (ESC-Net) to class-agnostic, binary salient object detection. It uses a fine-tuned CLIP ViT-L/14 encoder, a bank of salient-object prompts, and a pseudo-prompt generator with an adaptive fallback. The paper also contains a controlled comparative study of the adaptation choices (prompt bank, aggregation, prompt residual, fusion, decoder, loss, encoder fine-tuning). This repository reproduces every SPC-Net number in the paper.
 
 ## Repository structure
