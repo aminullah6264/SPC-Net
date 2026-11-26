@@ -1,6 +1,7 @@
-arXiv-2411.14723v2/
-Dataset/
+data/
+Datasets/
 outputs*/
+logs/
 # Python bytecode
 __pycache__/
 *.pyc
@@ -9,5 +10,24 @@ __pycache__/
 
 # macOS
 .DS_Store
-SIP_Dataset
-SIP_Dataset*
+
+/pretrained_models/
+
+# Model checkpoints and archives
+*.pth
+*.pt
+*.zip
+
+# macOS resource forks
+._*
+
+# LaTeX intermediates
+*.aux
+*.log
+*.out
+*.bbl
+*.blg
+*.brf
+*.fls
+*.fdb_latexmk
+*.synctex.gz
